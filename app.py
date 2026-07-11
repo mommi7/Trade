@@ -36,6 +36,10 @@ app = Flask(__name__)
 LAST_ANALYSIS = {}
 CACHE_LOCK = threading.Lock()
 
+# Cache in memoria dell'ultimo giro dello screener di mercato (vedi
+# run_market_screener più sotto), servita da /api/opportunities.
+SCREENER_CACHE = {"results": [], "updated": None}
+
 
 # --------------------------------------------------------------------------
 # Database
@@ -112,6 +116,22 @@ def init_db():
         "UPDATE tickers SET ticker = 'TSM' WHERE ticker = 'TSMC' "
         "AND NOT EXISTS (SELECT 1 FROM tickers WHERE ticker = 'TSM')"
     )
+
+    # Migrazioni additive per stop-loss dinamico e screener di mercato:
+    # SQLite non ha "ADD COLUMN IF NOT EXISTS", si prova e si ignora
+    # l'errore se la colonna esiste già (idempotente ad ogni avvio).
+    for ddl in [
+        "ALTER TABLE tickers ADD COLUMN high_water_mark REAL DEFAULT 0",
+        "ALTER TABLE tickers ADD COLUMN stop_notified_level REAL DEFAULT 0",
+        "ALTER TABLE tickers ADD COLUMN stop_triggered INTEGER DEFAULT 0",
+        "ALTER TABLE settings ADD COLUMN last_screener_sent TEXT",
+        "ALTER TABLE settings ADD COLUMN last_screener_results TEXT",
+    ]:
+        try:
+            conn.execute(ddl)
+        except sqlite3.OperationalError:
+            pass  # colonna già esistente
+
     conn.commit()
     conn.close()
 
@@ -217,12 +237,20 @@ def fetch_yahoo(ticker):
     return None
 
 
+def is_crypto_ticker(ticker):
+    """Riconosce simboli tipo BTC-USD, ETH-USD (formato Yahoo per le crypto)."""
+    return bool(re.match(r"^[A-Z0-9]{2,10}-[A-Z]{3,4}$", ticker.upper()))
+
+
 def fetch_stooq(ticker):
     """Fallback gratuito senza autenticazione, usato se Yahoo è bloccato.
     Copertura minore (soprattutto titoli USA) e niente nome/valuta precisi."""
-    symbol = ticker.lower()
-    if "." not in symbol:
-        symbol += ".us"
+    if is_crypto_ticker(ticker):
+        symbol = ticker.lower().replace("-", "")  # BTC-USD -> btcusd
+    else:
+        symbol = ticker.lower()
+        if "." not in symbol:
+            symbol += ".us"
     try:
         url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
         r = requests.get(url, headers=YAHOO_HEADERS, timeout=12)
@@ -254,16 +282,43 @@ def fetch_stooq(ticker):
         return None
 
 
+# Il piano free di Twelve Data limita a 8 richieste/minuto: senza un limite
+# lato nostro, il thread di background e un caricamento pagina concorrente
+# possono sommarsi e far scattare 429 solo su alcuni ticker (sintomo:
+# "funziona per alcuni titoli e non per altri" dopo un riavvio). Si
+# serializza qui con una finestra scorrevole, restando sotto il limite.
+_TWELVEDATA_LOCK = threading.Lock()
+_TWELVEDATA_CALL_TIMES = []
+_TWELVEDATA_MAX_PER_MINUTE = 6
+
+
+def _throttle_twelvedata():
+    with _TWELVEDATA_LOCK:
+        now = time.time()
+        while _TWELVEDATA_CALL_TIMES and now - _TWELVEDATA_CALL_TIMES[0] > 60:
+            _TWELVEDATA_CALL_TIMES.pop(0)
+        if len(_TWELVEDATA_CALL_TIMES) >= _TWELVEDATA_MAX_PER_MINUTE:
+            wait = 60 - (now - _TWELVEDATA_CALL_TIMES[0]) + 0.5
+            if wait > 0:
+                time.sleep(wait)
+            now = time.time()
+            while _TWELVEDATA_CALL_TIMES and now - _TWELVEDATA_CALL_TIMES[0] > 60:
+                _TWELVEDATA_CALL_TIMES.pop(0)
+        _TWELVEDATA_CALL_TIMES.append(time.time())
+
+
 def fetch_twelvedata(ticker):
     """Terzo fallback, con API key gratuita (twelvedata.com). Usato solo se
     TWELVEDATA_API_KEY è impostata: utile quando l'hosting cloud ha l'IP
     bloccato sia da Yahoo che da Stooq (capita su alcuni piani gratuiti)."""
     if not config.TWELVEDATA_API_KEY:
         return None
+    symbol = ticker.replace("-", "/") if is_crypto_ticker(ticker) else ticker
     try:
+        _throttle_twelvedata()
         url = "https://api.twelvedata.com/time_series"
         params = {
-            "symbol": ticker,
+            "symbol": symbol,
             "interval": "1day",
             "outputsize": 260,
             "apikey": config.TWELVEDATA_API_KEY,
@@ -414,6 +469,34 @@ COMMON_TICKERS = [
     {"symbol": "AMAT", "name": "Applied Materials"},
     {"symbol": "TER", "name": "Teradyne Inc."},
     {"symbol": "ENTG", "name": "Entegris Inc."},
+    {"symbol": "NOW", "name": "ServiceNow Inc."},
+    {"symbol": "PANW", "name": "Palo Alto Networks"},
+    {"symbol": "CRWD", "name": "CrowdStrike Holdings"},
+    {"symbol": "SNPS", "name": "Synopsys Inc."},
+    {"symbol": "CDNS", "name": "Cadence Design Systems"},
+    {"symbol": "ORCL", "name": "Oracle Corp."},
+    # Crypto (formato Yahoo: TICKER-USD)
+    {"symbol": "BTC-USD", "name": "Bitcoin"},
+    {"symbol": "ETH-USD", "name": "Ethereum"},
+    {"symbol": "SOL-USD", "name": "Solana"},
+    {"symbol": "BNB-USD", "name": "BNB"},
+    {"symbol": "XRP-USD", "name": "XRP"},
+    {"symbol": "ADA-USD", "name": "Cardano"},
+    {"symbol": "DOGE-USD", "name": "Dogecoin"},
+    {"symbol": "AVAX-USD", "name": "Avalanche"},
+    {"symbol": "LINK-USD", "name": "Chainlink"},
+    {"symbol": "DOT-USD", "name": "Polkadot"},
+]
+
+# Universo di titoli "bottleneck" (monopoli/quasi-monopoli tecnologici) su
+# cui gira lo screener automatico di mercato: la stessa logica di
+# compute_signal(), applicata a candidati che NON sono ancora in
+# portafoglio, per suggerire nuovi acquisti oltre ai titoli già tracciati.
+BOTTLENECK_UNIVERSE = [
+    "NVDA", "ORCL", "MSFT", "GOOGL", "AMZN", "META", "AVGO", "TSM", "ASML",
+    "MU", "AMD", "ADBE", "CRM", "NOW", "PANW", "CRWD", "SNPS", "CDNS",
+    "LRCX", "KLAC", "AMAT", "TXN", "QCOM", "INTC", "ARM", "MRVL", "NXPI",
+    "STM", "ON", "TER", "ENTG", "IBM", "CSCO",
 ]
 
 
@@ -667,6 +750,83 @@ def notify_alert(ticker, condition, threshold, price):
     send_mail(subject, body)
 
 
+def notify_stop_raised(ticker, new_stop, high_water_mark):
+    subject = f"📈 CECCHINO: {ticker} — stop loss alzato a {new_stop}"
+    body = (
+        f"Ticker: {ticker}\n"
+        f"Nuovo massimo raggiunto: {high_water_mark}\n"
+        f"Stop loss suggerito aggiornato: {new_stop} "
+        f"(-{TRAILING_STOP_PCT * 100:.0f}% dal massimo)\n\n"
+        "Il titolo è salito: alzare lo stop protegge il guadagno accumulato "
+        "senza doverlo decidere ogni volta a mano.\n\n"
+        f"Apri Cecchino: {config.PUBLIC_URL}"
+    )
+    send_mail(subject, body)
+
+
+def notify_stop_triggered(ticker, stop_level, price):
+    subject = f"⚠️ CECCHINO STOP LOSS: {ticker} sotto {stop_level}"
+    body = (
+        f"Ticker: {ticker}\n"
+        f"Prezzo attuale: {price}\n"
+        f"Stop loss suggerito: {stop_level}\n\n"
+        "Il prezzo ha rotto la soglia di protezione: valuta di vendere per "
+        "limitare le perdite o proteggere il guadagno accumulato.\n\n"
+        f"Apri Cecchino: {config.PUBLIC_URL}"
+    )
+    send_mail(subject, body)
+
+
+# --------------------------------------------------------------------------
+# Stop loss dinamico (trailing stop)
+# --------------------------------------------------------------------------
+# Percentuale sotto il massimo storico raggiunto dall'acquisto: valore fisso
+# semplice e trasparente (non un parametro nascosto), tipico di uno stop a
+# trailing usato dai trader retail per posizioni "buy and hold" azionarie.
+TRAILING_STOP_PCT = 0.10
+
+
+def check_trailing_stop(conn, ticker, price):
+    """Solo per titoli effettivamente posseduti (qty > 0): aggiorna il
+    massimo storico dall'acquisto e lo stop-loss a trailing (10% sotto il
+    massimo). Avvisa quando lo stop sale di almeno il 3% (per proteggere
+    un guadagno crescente senza spam) o quando il prezzo lo rompe."""
+    row = conn.execute(
+        "SELECT qty, high_water_mark, stop_notified_level, stop_triggered "
+        "FROM tickers WHERE ticker = ?",
+        (ticker,),
+    ).fetchone()
+    if row is None or not row["qty"]:
+        return None
+
+    high_water_mark = max(row["high_water_mark"] or 0, price)
+    stop_level = round(high_water_mark * (1 - TRAILING_STOP_PCT), 2)
+    stop_notified_level = row["stop_notified_level"] or 0
+    stop_triggered = row["stop_triggered"] or 0
+
+    conn.execute("UPDATE tickers SET high_water_mark = ? WHERE ticker = ?", (high_water_mark, ticker))
+    conn.commit()
+
+    if price <= stop_level:
+        if not stop_triggered:
+            conn.execute("UPDATE tickers SET stop_triggered = 1 WHERE ticker = ?", (ticker,))
+            conn.commit()
+            notify_stop_triggered(ticker, stop_level, price)
+    else:
+        if stop_triggered:
+            conn.execute("UPDATE tickers SET stop_triggered = 0 WHERE ticker = ?", (ticker,))
+            conn.commit()
+        if stop_notified_level == 0 or stop_level >= stop_notified_level * 1.03:
+            conn.execute(
+                "UPDATE tickers SET stop_notified_level = ? WHERE ticker = ?", (stop_level, ticker)
+            )
+            conn.commit()
+            if stop_notified_level > 0:  # non avvisare al primo calcolo in assoluto
+                notify_stop_raised(ticker, stop_level, high_water_mark)
+
+    return stop_level
+
+
 # --------------------------------------------------------------------------
 # Storico segnali + Alert
 # --------------------------------------------------------------------------
@@ -723,6 +883,7 @@ def analyze_and_store(ticker, custom_buy, custom_sell):
     try:
         record_signal_if_changed(conn, ticker, result)
         check_alerts(conn, ticker, result["price"])
+        result["stop_loss"] = check_trailing_stop(conn, ticker, result["price"])
     finally:
         conn.close()
     return result
@@ -745,6 +906,75 @@ def refresh_all_portfolio():
             print(f"Errore aggiornamento {row['ticker']}: {e}")
 
 
+def notify_opportunities(results):
+    subject = f"💡 CECCHINO: {len(results)} opportunità sul mercato oggi"
+    blocks = []
+    for r in results:
+        reasons_txt = "; ".join(r["reasons"])
+        blocks.append(
+            f"{r['ticker']} ({r.get('name', '')}) — {r['signal']} score {r['score']}\n"
+            f"Prezzo: {r['price']} {r['currency']}\n{reasons_txt}"
+        )
+    body = (
+        "Titoli fuori dal tuo portafoglio con segnale BUY forte oggi "
+        "(universo bottleneck: monopoli/quasi-monopoli tech):\n\n"
+        + "\n\n".join(blocks)
+        + f"\n\nApri Cecchino: {config.PUBLIC_URL}"
+    )
+    send_mail(subject, body)
+
+
+def run_market_screener(send_email=True):
+    """Scansiona BOTTLENECK_UNIVERSE (titoli non già in portafoglio) e tiene
+    i migliori segnali BUY (score >= 40). Aggiorna sempre la cache per la UI;
+    manda una mail digest al massimo una volta al giorno per non spammare."""
+    conn = get_db()
+    try:
+        active_tickers = {
+            r["ticker"] for r in conn.execute("SELECT ticker FROM tickers WHERE active = 1").fetchall()
+        }
+    finally:
+        conn.close()
+
+    candidates = []
+    for ticker in BOTTLENECK_UNIVERSE:
+        if ticker in active_tickers:
+            continue
+        try:
+            result = analyze_ticker(ticker)
+        except Exception as e:
+            print(f"Errore screener per {ticker}: {e}")
+            continue
+        if "error" not in result and result["score"] >= 40:
+            candidates.append(result)
+
+    candidates.sort(key=lambda r: r["score"], reverse=True)
+    top = candidates[:5]
+
+    with CACHE_LOCK:
+        SCREENER_CACHE["results"] = top
+        SCREENER_CACHE["updated"] = datetime.now().isoformat(timespec="seconds")
+
+    if send_email and top:
+        today = datetime.now().strftime("%Y-%m-%d")
+        conn = get_db()
+        try:
+            row = conn.execute("SELECT last_screener_sent FROM settings WHERE id = 1").fetchone()
+            already_sent = row and row["last_screener_sent"] == today
+            if not already_sent:
+                notify_opportunities(top)
+                conn.execute(
+                    "INSERT INTO settings (id, last_screener_sent) VALUES (1, ?) "
+                    "ON CONFLICT(id) DO UPDATE SET last_screener_sent = excluded.last_screener_sent",
+                    (today,),
+                )
+                conn.commit()
+        finally:
+            conn.close()
+
+    return top
+
+
 def monitor_loop():
     """Thread di riserva per esecuzioni locali/24-7 reali (es. Raspberry Pi).
     Su hosting cloud gratuito che va in sleep, usa /api/cron/tick invece."""
@@ -752,6 +982,7 @@ def monitor_loop():
     while True:
         try:
             refresh_all_portfolio()
+            run_market_screener()
         except Exception as e:
             print(f"Errore monitor (riprova in 5 min): {e}")
             time.sleep(300)
@@ -780,6 +1011,7 @@ def api_cron_tick():
     if not config.CRON_SECRET or secret != config.CRON_SECRET:
         return jsonify({"error": "unauthorized"}), 401
     refresh_all_portfolio()
+    run_market_screener()
     return jsonify({"ok": True})
 
 
@@ -865,6 +1097,21 @@ def api_portfolio_remove(ticker):
 def api_portfolio_refresh():
     refresh_all_portfolio()
     return jsonify({"ok": True})
+
+
+# --------------------------------------------------------------------------
+# API - Opportunità (screener automatico sull'universo bottleneck)
+# --------------------------------------------------------------------------
+@app.route("/api/opportunities", methods=["GET"])
+def api_opportunities_list():
+    with CACHE_LOCK:
+        return jsonify({"results": SCREENER_CACHE["results"], "updated": SCREENER_CACHE["updated"]})
+
+
+@app.route("/api/opportunities/refresh", methods=["POST"])
+def api_opportunities_refresh():
+    top = run_market_screener(send_email=False)
+    return jsonify({"results": top, "updated": SCREENER_CACHE["updated"]})
 
 
 # --------------------------------------------------------------------------
@@ -1187,7 +1434,7 @@ nav.bottom button.active { color: var(--blue); }
     <div class="card">
       <div class="row">
         <div class="ticker-field" style="flex:1">
-          <input id="scan-input" placeholder="Ticker o nome (es. MU, Micron)" style="width:100%" autocapitalize="characters" autocomplete="off">
+          <input id="scan-input" placeholder="Ticker, nome o crypto (es. MU, Micron, BTC-USD)" style="width:100%" autocapitalize="characters" autocomplete="off">
           <div class="suggest-box" id="scan-suggest"></div>
         </div>
         <button onclick="scanTicker()">Analizza</button>
@@ -1205,7 +1452,7 @@ nav.bottom button.active { color: var(--blue); }
     <div class="card" id="add-form" style="display:none">
       <div class="form-grid">
         <div class="ticker-field full">
-          <input id="pf-ticker" placeholder="Ticker o nome" style="width:100%" autocomplete="off">
+          <input id="pf-ticker" placeholder="Ticker o nome (anche crypto: BTC-USD)" style="width:100%" autocomplete="off">
           <div class="suggest-box" id="pf-suggest"></div>
         </div>
         <input id="pf-qty" placeholder="Quantità" type="number" step="any">
@@ -1243,11 +1490,24 @@ nav.bottom button.active { color: var(--blue); }
     <div class="card" id="history-stats"></div>
     <div id="history-list"></div>
   </div>
+
+  <!-- OPPORTUNITÀ -->
+  <div class="tab-view" id="tab-opportunities">
+    <div class="card">
+      <div class="row">
+        <div class="dim" style="font-size:12px">🤖 Scansione automatica di ~30 titoli "bottleneck" (monopoli tech: NVDA, ORCL, ASML, ...) non ancora nel tuo portafoglio, aggiornata ogni ora. Mostra solo segnali BUY forti (score ≥ 40).</div>
+        <button class="secondary" onclick="refreshOpportunities()" style="white-space:nowrap">🔄 Aggiorna</button>
+      </div>
+    </div>
+    <div id="opportunities-updated" class="dim" style="font-size:12px;margin-bottom:8px"></div>
+    <div id="opportunities-list"></div>
+  </div>
 </div>
 
 <nav class="bottom">
   <button id="nav-scanner" class="active" onclick="showTab('scanner')">🔍 Scanner</button>
   <button id="nav-portfolio" onclick="showTab('portfolio')">💼 Portafoglio</button>
+  <button id="nav-opportunities" onclick="showTab('opportunities')">💡 Opportunità</button>
   <button id="nav-alerts" onclick="showTab('alerts')">🔔 Alert</button>
   <button id="nav-history" onclick="showTab('history')">📜 Storico</button>
 </nav>
@@ -1373,12 +1633,16 @@ function showTab(name) {
   if (name === 'portfolio') loadPortfolio();
   if (name === 'alerts') loadAlerts();
   if (name === 'history') loadHistory();
+  if (name === 'opportunities') loadOpportunities();
 }
 
 function renderAnalysisCard(a, extraButtons) {
   if (a.error) {
     return `<div class="card"><div class="row"><b>${a.ticker}</b><span class="dim">${a.error}</span></div></div>`;
   }
+  const stopTile = a.stop_loss != null
+    ? `<div class="metric"><div class="val" style="color:var(--sell)">${a.stop_loss}</div><div class="lbl">Stop loss 🛡️</div></div>`
+    : '';
   const metrics = `
     <div class="metrics">
       <div class="metric"><div class="val">${a.rsi}</div><div class="lbl">RSI 14</div></div>
@@ -1389,6 +1653,7 @@ function renderAnalysisCard(a, extraButtons) {
       <div class="metric"><div class="val">${a.vol_ratio != null ? a.vol_ratio + 'x' : '—'}</div><div class="lbl">Volume/media</div></div>
       <div class="metric"><div class="val">${a.suggested_buy}</div><div class="lbl">Zona acquisto 🤖</div></div>
       <div class="metric"><div class="val">${a.suggested_sell}</div><div class="lbl">Zona vendita 🤖</div></div>
+      ${stopTile}
       <div class="metric"><div class="val">${a.updated.slice(11,16)}</div><div class="lbl">Aggiornato</div></div>
     </div>`;
   const reasons = `<div class="reasons">${a.reasons.map(r => `<div>• ${r}</div>`).join('')}</div>`;
@@ -1551,6 +1816,35 @@ async function loadHistory() {
       </div>
       <div class="reasons">${h.reasons.map(r => `<div>• ${r}</div>`).join('')}</div>
     </div>`).join('');
+}
+
+async function loadOpportunities() {
+  document.getElementById('opportunities-list').innerHTML = '<div class="spinner">Caricamento…</div>';
+  const res = await fetch('/api/opportunities');
+  const data = await res.json();
+  renderOpportunities(data);
+}
+
+async function refreshOpportunities() {
+  document.getElementById('opportunities-list').innerHTML = '<div class="spinner">Scansione del mercato in corso, può richiedere qualche minuto…</div>';
+  const res = await fetch('/api/opportunities/refresh', { method: 'POST' });
+  const data = await res.json();
+  renderOpportunities(data);
+}
+
+function renderOpportunities(data) {
+  document.getElementById('opportunities-updated').textContent = data.updated
+    ? `Ultima scansione: ${data.updated.replace('T', ' ').slice(0, 16)}`
+    : 'Nessuna scansione ancora eseguita: premi "Aggiorna" oppure attendi il prossimo giro automatico (ogni ora).';
+  const container = document.getElementById('opportunities-list');
+  if (!data.results || data.results.length === 0) {
+    container.innerHTML = '<div class="dim">Nessuna opportunità BUY forte al momento fuori dal tuo portafoglio.</div>';
+    return;
+  }
+  container.innerHTML = data.results.map(a => {
+    const btn = `<button style="margin-top:10px" onclick="quickAdd('${a.ticker}', ${a.price})">+ Aggiungi al portafoglio</button>`;
+    return renderAnalysisCard(a, btn);
+  }).join('');
 }
 </script>
 </body>

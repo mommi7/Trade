@@ -143,15 +143,35 @@ Configuralo così:
   SNDK, TSM) con quantità, prezzo pagato, P&L in € e %, segnale attuale,
   soglie personali di acquisto/vendita. Aggiornamento automatico ogni ora
   (thread locale e/o tick esterno) o manuale dal pulsante "Aggiorna
-  prezzi".
+  prezzi". Puoi aggiungere/rimuovere qualsiasi titolo, incluse le
+  **crypto** (formato Yahoo: `BTC-USD`, `ETH-USD`, `SOL-USD`, ecc.).
+- **Stop loss dinamico (trailing stop)**: per ogni titolo che possiedi
+  (quantità > 0) l'app calcola in automatico uno stop-loss al 10% sotto il
+  massimo storico raggiunto da quando lo possiedi, mostrato nella card
+  come "Stop loss 🛡️". Quando il titolo sale e lo stop si alza di almeno
+  il 3% arriva una mail per farti sapere che il guadagno è più protetto;
+  se il prezzo rompe lo stop arriva una mail di avviso a vendere/valutare
+  la posizione. Nessuna configurazione richiesta, gira da solo col resto
+  del monitoraggio orario.
+- **Opportunità (screener di mercato)**: una scansione automatica, ogni
+  ora, di circa 30 titoli "bottleneck" (monopoli/quasi-monopoli
+  tecnologici: NVDA, ORCL, AVGO, ASML, TSM, ...) **non ancora nel tuo
+  portafoglio**. Chi ha un segnale BUY forte (score ≥ 40) compare nel tab
+  "Opportunità" con lo stesso dettaglio delle altre card, pronto per
+  essere aggiunto al portafoglio con un click. Una mail digest parte al
+  massimo una volta al giorno per non spammarti.
 - **Ricerca ticker con suggerimenti**: scrivendo un simbolo o un nome
-  (es. "micro") negli input di Scanner, Portafoglio e Alert compare un
-  menu a tendina con i titoli corrispondenti, da selezionare con un click.
+  (es. "micro", "bitcoin") negli input di Scanner, Portafoglio e Alert
+  compare un menu a tendina con i titoli corrispondenti, da selezionare
+  con un click.
 - **Alert**: soglie di prezzo (sopra/sotto) per qualsiasi ticker; quando
   scattano inviano una mail e vengono segnate come "scattato".
 - **Storico**: ogni cambio di segnale (es. BUY → SELL) su un titolo
   tracciato viene registrato con data, prezzo e motivazione, con
   statistiche riassuntive dei cambi.
+- **Commento AI (opzionale)**: se imposti `GEMINI_API_KEY` (gratis, vedi
+  sotto), ogni analisi include un breve commento in linguaggio naturale
+  generato da Google Gemini sopra ai dati tecnici.
 
 ## Se "Impossibile recuperare dati" persiste su hosting cloud
 
@@ -225,8 +245,23 @@ condiviso).
   bloccato, solo con una copertura più limitata.
 - Un ticker che fallisce (rete, ticker inesistente, formato dati inatteso)
   non blocca l'analisi degli altri: ogni chiamata è avvolta in try/except.
+- Le chiamate a Twelve Data sono limitate lato app a 6/minuto (il piano
+  free ne consente 8): senza questo limite, il thread di background e un
+  caricamento pagina concorrenti potevano sommare le richieste e far
+  scattare 429 solo su alcuni ticker (sintomo tipico: "funziona per
+  alcuni titoli e non per altri" subito dopo un riavvio/redeploy).
+- Lo screener "Opportunità" gira sull'universo `BOTTLENECK_UNIVERSE`
+  definito in `app.py` (personalizzabile modificando quella lista): per
+  ogni titolo non già in portafoglio applica la stessa `compute_signal()`
+  usata ovunque nell'app, tiene solo score ≥ 40, e manda al massimo una
+  mail digest al giorno (deduplicata tramite `settings.last_screener_sent`).
+- Lo stop loss dinamico usa `tickers.high_water_mark` (il massimo prezzo
+  visto da quando possiedi il titolo) e uno scarto fisso del 10%
+  (`TRAILING_STOP_PCT` in `app.py`): trasparente e modificabile, non un
+  parametro nascosto.
 - L'app non ha login/password: è pensata per un solo utilizzatore che
   imposta la propria email di notifica dalla UI.
 - `POST /api/cron/tick` (protetto da `X-Cron-Secret`) aggiorna tutti i
-  segnali: è pensato per essere chiamato da un trigger esterno gratuito
-  (GitHub Actions) quando l'hosting va in sleep.
+  segnali **e** fa girare lo screener di mercato: è pensato per essere
+  chiamato da un trigger esterno gratuito (GitHub Actions) quando
+  l'hosting va in sleep.
