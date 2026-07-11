@@ -140,10 +140,13 @@ Configuralo così:
   MA200, distanza da massimo/minimo 52 settimane, segnale e motivazioni in
   italiano).
 - **Portafoglio**: titoli tracciati (precompilato con MU, ASML, MSFT,
-  SNDK, TSMC) con quantità, prezzo pagato, P&L in € e %, segnale attuale,
+  SNDK, TSM) con quantità, prezzo pagato, P&L in € e %, segnale attuale,
   soglie personali di acquisto/vendita. Aggiornamento automatico ogni ora
   (thread locale e/o tick esterno) o manuale dal pulsante "Aggiorna
   prezzi".
+- **Ricerca ticker con suggerimenti**: scrivendo un simbolo o un nome
+  (es. "micro") negli input di Scanner, Portafoglio e Alert compare un
+  menu a tendina con i titoli corrispondenti, da selezionare con un click.
 - **Alert**: soglie di prezzo (sopra/sotto) per qualsiasi ticker; quando
   scattano inviano una mail e vengono segnate come "scattato".
 - **Storico**: ogni cambio di segnale (es. BUY → SELL) su un titolo
@@ -152,11 +155,23 @@ Configuralo così:
 
 ## Note tecniche
 
-- I dati di mercato vengono presi direttamente dall'endpoint pubblico
-  `chart` di Yahoo Finance via `requests` (nessuna libreria `yfinance`),
-  con fallback automatico tra `query1` e `query2.finance.yahoo.com`.
+- I dati di mercato vengono presi dall'endpoint pubblico `chart` di Yahoo
+  Finance via `requests` (nessuna libreria `yfinance`), con fallback
+  automatico tra `query1` e `query2.finance.yahoo.com`. Se Yahoo è
+  irraggiungibile (capita su alcuni hosting cloud, che condividono pool di
+  IP a volte limitati da Yahoo) l'app prova automaticamente **Stooq**
+  come seconda fonte gratuita, senza bisogno di configurazione.
+- La ricerca ticker unisce un elenco locale di ~70 titoli comuni (sempre
+  disponibile, istantaneo) ai risultati live della ricerca Yahoo quando
+  raggiungibile — quindi i suggerimenti funzionano anche se Yahoo è
+  bloccato, solo con una copertura più limitata.
 - Un ticker che fallisce (rete, ticker inesistente, formato dati inatteso)
   non blocca l'analisi degli altri: ogni chiamata è avvolta in try/except.
+- Se su un deploy cloud vedi "Impossibile recuperare dati" per **tutti**
+  i titoli (anche per uno enorme e liquido come MSFT), è quasi certamente
+  Yahoo che blocca l'IP condiviso di quell'hosting: controlla i log del
+  servizio, dove ora viene stampato lo status HTTP esatto restituito da
+  Yahoo per capire se è un blocco temporaneo (429) o altro.
 - L'app non ha login/password: è pensata per un solo utilizzatore che
   imposta la propria email di notifica dalla UI.
 - `POST /api/cron/tick` (protetto da `X-Cron-Secret`) aggiorna tutti i

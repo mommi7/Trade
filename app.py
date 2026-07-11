@@ -105,6 +105,14 @@ def init_db():
                 ),
             )
         conn.commit()
+
+    # Migrazione: il ticker corretto di Taiwan Semiconductor è "TSM", non
+    # "TSMC" (mai stato un simbolo valido su nessun mercato).
+    conn.execute(
+        "UPDATE tickers SET ticker = 'TSM' WHERE ticker = 'TSMC' "
+        "AND NOT EXISTS (SELECT 1 FROM tickers WHERE ticker = 'TSM')"
+    )
+    conn.commit()
     conn.close()
 
 
@@ -145,15 +153,46 @@ def api_settings_set():
 
 
 # --------------------------------------------------------------------------
-# Dati di mercato (Yahoo Finance via requests, niente yfinance)
+# Dati di mercato (Yahoo Finance via requests, con fallback su Stooq)
 # --------------------------------------------------------------------------
+# Molti hosting cloud gratuiti (Render, Railway, ecc.) condividono pool di IP
+# che Yahoo Finance a volte blocca o limita in modo aggressivo (429/999),
+# mentre in locale/Raspberry Pi funziona quasi sempre. Per non lasciare
+# l'app rotta in quel caso, si tiene una sessione con cookie "scaldati" e,
+# se Yahoo fallisce comunque, si prova Stooq come seconda fonte gratuita.
+YAHOO_SESSION = requests.Session()
+YAHOO_SESSION.headers.update(
+    {
+        "User-Agent": YAHOO_HEADERS["User-Agent"],
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9,it;q=0.8",
+    }
+)
+_yahoo_warmed = False
+
+
+def _warm_yahoo_session():
+    """Visita la home Yahoo una volta per ottenere i cookie di consenso;
+    riduce (non elimina) i blocchi 429 dai datacenter cloud."""
+    global _yahoo_warmed
+    if _yahoo_warmed:
+        return
+    try:
+        YAHOO_SESSION.get("https://fc.yahoo.com", timeout=8)
+    except Exception:
+        pass
+    _yahoo_warmed = True
+
+
 def fetch_yahoo(ticker):
     """Fetch diretto senza yfinance. Prova 2 server, torna None se falliscono entrambi."""
+    _warm_yahoo_session()
     for base in ["query1", "query2"]:
         try:
             url = f"https://{base}.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=2y"
-            r = requests.get(url, headers=YAHOO_HEADERS, timeout=12)
+            r = YAHOO_SESSION.get(url, timeout=12)
             if r.status_code != 200:
+                print(f"Yahoo {base} HTTP {r.status_code} per {ticker}: {r.text[:200]!r}")
                 continue
             j = r.json()
             result = j["chart"]["result"][0]
@@ -170,6 +209,156 @@ def fetch_yahoo(ticker):
         except Exception as e:
             print(f"Yahoo {base} fallito per {ticker}: {e}")
     return None
+
+
+def fetch_stooq(ticker):
+    """Fallback gratuito senza autenticazione, usato se Yahoo è bloccato.
+    Copertura minore (soprattutto titoli USA) e niente nome/valuta precisi."""
+    symbol = ticker.lower()
+    if "." not in symbol:
+        symbol += ".us"
+    try:
+        url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
+        r = requests.get(url, headers=YAHOO_HEADERS, timeout=12)
+        if r.status_code != 200 or not r.text.startswith("Date,"):
+            return None
+        closes = []
+        for line in r.text.strip().splitlines()[1:]:
+            parts = line.split(",")
+            if len(parts) >= 5:
+                try:
+                    closes.append(float(parts[4]))
+                except ValueError:
+                    continue
+        closes = closes[-504:]  # circa 2 anni di sedute
+        if len(closes) < 2:
+            return None
+        return {
+            "closes": closes,
+            "price": closes[-1],
+            "currency": "USD",
+            "name": ticker.upper(),
+        }
+    except Exception as e:
+        print(f"Stooq fallito per {ticker}: {e}")
+        return None
+
+
+def fetch_market_data(ticker):
+    """Yahoo come fonte primaria, Stooq come riserva se Yahoo è irraggiungibile."""
+    return fetch_yahoo(ticker) or fetch_stooq(ticker)
+
+
+# --------------------------------------------------------------------------
+# Ricerca ticker per suggerimenti (Scanner / Portafoglio / Alert)
+# --------------------------------------------------------------------------
+# Elenco locale di titoli comuni: garantisce suggerimenti istantanei anche
+# quando la ricerca live su Yahoo è bloccata (stesso problema di fetch_yahoo).
+COMMON_TICKERS = [
+    {"symbol": "AAPL", "name": "Apple Inc."},
+    {"symbol": "MSFT", "name": "Microsoft Corp."},
+    {"symbol": "GOOGL", "name": "Alphabet Inc. (Google)"},
+    {"symbol": "AMZN", "name": "Amazon.com Inc."},
+    {"symbol": "NVDA", "name": "NVIDIA Corp."},
+    {"symbol": "TSLA", "name": "Tesla Inc."},
+    {"symbol": "META", "name": "Meta Platforms Inc."},
+    {"symbol": "MU", "name": "Micron Technology"},
+    {"symbol": "ASML", "name": "ASML Holding"},
+    {"symbol": "TSM", "name": "Taiwan Semiconductor Manufacturing (TSMC)"},
+    {"symbol": "SNDK", "name": "SanDisk Corp."},
+    {"symbol": "AMD", "name": "Advanced Micro Devices"},
+    {"symbol": "INTC", "name": "Intel Corp."},
+    {"symbol": "AVGO", "name": "Broadcom Inc."},
+    {"symbol": "ORCL", "name": "Oracle Corp."},
+    {"symbol": "CRM", "name": "Salesforce Inc."},
+    {"symbol": "ADBE", "name": "Adobe Inc."},
+    {"symbol": "NFLX", "name": "Netflix Inc."},
+    {"symbol": "DIS", "name": "Walt Disney Co."},
+    {"symbol": "KO", "name": "Coca-Cola Co."},
+    {"symbol": "PEP", "name": "PepsiCo Inc."},
+    {"symbol": "JPM", "name": "JPMorgan Chase & Co."},
+    {"symbol": "V", "name": "Visa Inc."},
+    {"symbol": "MA", "name": "Mastercard Inc."},
+    {"symbol": "WMT", "name": "Walmart Inc."},
+    {"symbol": "HD", "name": "Home Depot Inc."},
+    {"symbol": "PG", "name": "Procter & Gamble Co."},
+    {"symbol": "JNJ", "name": "Johnson & Johnson"},
+    {"symbol": "UNH", "name": "UnitedHealth Group"},
+    {"symbol": "XOM", "name": "Exxon Mobil Corp."},
+    {"symbol": "CVX", "name": "Chevron Corp."},
+    {"symbol": "BAC", "name": "Bank of America Corp."},
+    {"symbol": "PFE", "name": "Pfizer Inc."},
+    {"symbol": "T", "name": "AT&T Inc."},
+    {"symbol": "VZ", "name": "Verizon Communications"},
+    {"symbol": "CSCO", "name": "Cisco Systems"},
+    {"symbol": "QCOM", "name": "Qualcomm Inc."},
+    {"symbol": "TXN", "name": "Texas Instruments"},
+    {"symbol": "IBM", "name": "IBM Corp."},
+    {"symbol": "GE", "name": "General Electric Co."},
+    {"symbol": "BA", "name": "Boeing Co."},
+    {"symbol": "CAT", "name": "Caterpillar Inc."},
+    {"symbol": "MCD", "name": "McDonald's Corp."},
+    {"symbol": "NKE", "name": "Nike Inc."},
+    {"symbol": "SBUX", "name": "Starbucks Corp."},
+    {"symbol": "COST", "name": "Costco Wholesale"},
+    {"symbol": "LOW", "name": "Lowe's Companies"},
+    {"symbol": "UPS", "name": "United Parcel Service"},
+    {"symbol": "GS", "name": "Goldman Sachs Group"},
+    {"symbol": "MS", "name": "Morgan Stanley"},
+    {"symbol": "AXP", "name": "American Express Co."},
+    {"symbol": "UBER", "name": "Uber Technologies"},
+    {"symbol": "ABNB", "name": "Airbnb Inc."},
+    {"symbol": "SHOP", "name": "Shopify Inc."},
+    {"symbol": "PYPL", "name": "PayPal Holdings"},
+    {"symbol": "SQ", "name": "Block Inc. (Square)"},
+    {"symbol": "SNOW", "name": "Snowflake Inc."},
+    {"symbol": "PLTR", "name": "Palantir Technologies"},
+    {"symbol": "COIN", "name": "Coinbase Global"},
+    {"symbol": "ARM", "name": "Arm Holdings"},
+    {"symbol": "SMCI", "name": "Super Micro Computer"},
+    {"symbol": "STM", "name": "STMicroelectronics"},
+    {"symbol": "NXPI", "name": "NXP Semiconductors"},
+    {"symbol": "ON", "name": "ON Semiconductor"},
+    {"symbol": "MRVL", "name": "Marvell Technology"},
+    {"symbol": "LRCX", "name": "Lam Research"},
+    {"symbol": "KLAC", "name": "KLA Corp."},
+    {"symbol": "AMAT", "name": "Applied Materials"},
+    {"symbol": "TER", "name": "Teradyne Inc."},
+    {"symbol": "ENTG", "name": "Entegris Inc."},
+]
+
+
+def search_local_tickers(query):
+    ql = query.strip().lower()
+    if not ql:
+        return []
+    matches = [
+        t for t in COMMON_TICKERS if ql in t["symbol"].lower() or ql in t["name"].lower()
+    ]
+    matches.sort(key=lambda t: (not t["symbol"].lower().startswith(ql), t["symbol"]))
+    return matches
+
+
+def search_yahoo_tickers(query):
+    _warm_yahoo_session()
+    try:
+        url = "https://query1.finance.yahoo.com/v1/finance/search"
+        r = YAHOO_SESSION.get(
+            url, params={"q": query, "quotesCount": 8, "newsCount": 0}, timeout=8
+        )
+        if r.status_code != 200:
+            return []
+        quotes = r.json().get("quotes", [])
+        out = []
+        for q in quotes:
+            symbol = q.get("symbol")
+            name = q.get("shortname") or q.get("longname")
+            if symbol and name:
+                out.append({"symbol": symbol, "name": name})
+        return out
+    except Exception as e:
+        print(f"Ricerca Yahoo fallita per '{query}': {e}")
+        return []
 
 
 # --------------------------------------------------------------------------
@@ -289,7 +478,7 @@ def compute_signal(closes, price, custom_buy=None, custom_sell=None):
 def analyze_ticker(ticker, custom_buy=None, custom_sell=None):
     """Recupera i dati e calcola il segnale per un ticker. Non solleva mai eccezioni."""
     try:
-        data = fetch_yahoo(ticker)
+        data = fetch_market_data(ticker)
         if not data or len(data["closes"]) < 2:
             return {"ticker": ticker, "error": f"Impossibile recuperare dati per {ticker}"}
 
@@ -578,6 +767,23 @@ def api_scan(ticker):
     return jsonify(result)
 
 
+@app.route("/api/search/<query>", methods=["GET"])
+def api_search(query):
+    """Suggerimenti ticker per nome o simbolo: lista locale (sempre disponibile)
+    unita ai risultati live di Yahoo (se raggiungibile)."""
+    query = query.strip()
+    if not query:
+        return jsonify([])
+
+    merged = {t["symbol"]: t for t in search_local_tickers(query)}
+    for t in search_yahoo_tickers(query):
+        merged.setdefault(t["symbol"], t)
+
+    ql = query.lower()
+    ranked = sorted(merged.values(), key=lambda t: (not t["symbol"].lower().startswith(ql), t["symbol"]))
+    return jsonify(ranked[:8])
+
+
 # --------------------------------------------------------------------------
 # API - Alert
 # --------------------------------------------------------------------------
@@ -790,6 +996,31 @@ nav.bottom button.active { color: var(--blue); }
 .pnl-neg { color: var(--sell); }
 .spinner { color: var(--dim); font-size: 13px; }
 
+.ticker-field { position: relative; }
+.suggest-box {
+  position: absolute;
+  left: 0; right: 0; top: calc(100% + 4px);
+  background: var(--card2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  z-index: 50;
+  max-height: 240px;
+  overflow-y: auto;
+  display: none;
+}
+.suggest-box.open { display: block; }
+.suggest-item {
+  padding: 9px 10px;
+  cursor: pointer;
+  font-size: 13px;
+  border-bottom: 1px solid var(--border);
+}
+.suggest-item:last-child { border-bottom: none; }
+.suggest-item:hover, .suggest-item.active { background: var(--border); }
+.suggest-item b { color: var(--text); }
+.suggest-item span { color: var(--dim); margin-left: 6px; }
+
 #email-gate {
   position: fixed;
   inset: 0;
@@ -830,7 +1061,10 @@ nav.bottom button.active { color: var(--blue); }
   <div class="tab-view active" id="tab-scanner">
     <div class="card">
       <div class="row">
-        <input id="scan-input" placeholder="Ticker (es. MU, ASML)" style="flex:1" autocapitalize="characters">
+        <div class="ticker-field" style="flex:1">
+          <input id="scan-input" placeholder="Ticker o nome (es. MU, Micron)" style="width:100%" autocapitalize="characters" autocomplete="off">
+          <div class="suggest-box" id="scan-suggest"></div>
+        </div>
         <button onclick="scanTicker()">Analizza</button>
       </div>
     </div>
@@ -845,7 +1079,10 @@ nav.bottom button.active { color: var(--blue); }
     </div>
     <div class="card" id="add-form" style="display:none">
       <div class="form-grid">
-        <input id="pf-ticker" placeholder="Ticker" class="full">
+        <div class="ticker-field full">
+          <input id="pf-ticker" placeholder="Ticker o nome" style="width:100%" autocomplete="off">
+          <div class="suggest-box" id="pf-suggest"></div>
+        </div>
         <input id="pf-qty" placeholder="Quantità" type="number" step="any">
         <input id="pf-paid" placeholder="Totale pagato €" type="number" step="any">
         <input id="pf-buy" placeholder="Soglia acquisto" type="number" step="any">
@@ -860,7 +1097,10 @@ nav.bottom button.active { color: var(--blue); }
   <div class="tab-view" id="tab-alerts">
     <div class="card">
       <div class="form-grid">
-        <input id="al-ticker" placeholder="Ticker" class="full">
+        <div class="ticker-field full">
+          <input id="al-ticker" placeholder="Ticker o nome" style="width:100%" autocomplete="off">
+          <div class="suggest-box" id="al-suggest"></div>
+        </div>
         <select id="al-cond">
           <option value="below">Sotto</option>
           <option value="above">Sopra</option>
@@ -937,6 +1177,67 @@ function openEmailEdit() {
 }
 
 refreshEmailUI();
+
+function attachTickerSuggest(inputId, boxId, onPick) {
+  const input = document.getElementById(inputId);
+  const box = document.getElementById(boxId);
+  let timer = null;
+  let items = [];
+  let activeIdx = -1;
+
+  function close() {
+    box.classList.remove('open');
+    box.innerHTML = '';
+    items = [];
+    activeIdx = -1;
+  }
+
+  function render() {
+    if (items.length === 0) { close(); return; }
+    box.innerHTML = items.map((it, i) => `
+      <div class="suggest-item${i === activeIdx ? ' active' : ''}" data-idx="${i}">
+        <b>${it.symbol}</b><span>${it.name}</span>
+      </div>`).join('');
+    box.classList.add('open');
+    box.querySelectorAll('.suggest-item').forEach(el => {
+      el.addEventListener('mousedown', (e) => {
+        e.preventDefault();
+        const it = items[parseInt(el.dataset.idx, 10)];
+        input.value = it.symbol;
+        close();
+        if (onPick) onPick(it);
+      });
+    });
+  }
+
+  input.addEventListener('input', () => {
+    const q = input.value.trim();
+    clearTimeout(timer);
+    if (q.length < 1) { close(); return; }
+    timer = setTimeout(async () => {
+      try {
+        const res = await fetch(`/api/search/${encodeURIComponent(q)}`);
+        items = await res.json();
+        activeIdx = -1;
+        render();
+      } catch (e) { close(); }
+    }, 250);
+  });
+
+  input.addEventListener('keydown', (e) => {
+    if (!box.classList.contains('open')) return;
+    if (e.key === 'ArrowDown') { e.preventDefault(); activeIdx = Math.min(activeIdx + 1, items.length - 1); render(); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); activeIdx = Math.max(activeIdx - 1, 0); render(); }
+    else if (e.key === 'Enter' && activeIdx >= 0) { e.preventDefault(); input.value = items[activeIdx].symbol; close(); if (onPick) onPick(items[activeIdx]); }
+    else if (e.key === 'Escape') { close(); }
+  });
+
+  input.addEventListener('blur', () => setTimeout(close, 150));
+}
+
+attachTickerSuggest('scan-input', 'scan-suggest');
+attachTickerSuggest('pf-ticker', 'pf-suggest');
+attachTickerSuggest('al-ticker', 'al-suggest');
 
 function showTab(name) {
   document.querySelectorAll('.tab-view').forEach(el => el.classList.remove('active'));
