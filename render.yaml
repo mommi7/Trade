@@ -9,17 +9,11 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn -w 1 app:app
     envVars:
-      - key: CECCHINO_SECRET_KEY
-        generateValue: true
       - key: CECCHINO_CRON_SECRET
         generateValue: true
       - key: CECCHINO_EMAIL_FROM
         sync: false
       - key: CECCHINO_EMAIL_PASSWORD
-        sync: false
-      - key: GOOGLE_CLIENT_ID
-        sync: false
-      - key: GOOGLE_CLIENT_SECRET
         sync: false
       - key: CECCHINO_PUBLIC_URL
         sync: false

@@ -1,10 +1,9 @@
 # Cecchino Pro
 
-Sistema di trading signal monitoring multi-utente, con **login "Accedi con
-Google"**: ogni utente ha il proprio portafoglio e riceve gli alert BUY/SELL
-via mail al proprio indirizzo Google. Calcola segnali basati su RSI, medie
-mobili e distanza dai massimi/minimi a 52 settimane, con Scanner, Portafoglio,
-Alert e Storico.
+Sistema di trading signal monitoring. Alla prima apertura chiede solo
+**l'email a cui mandare gli alert** (niente login, niente account Google da
+configurare) — poi Scanner, Portafoglio, Alert e Storico. Calcola segnali
+basati su RSI, medie mobili e distanza dai massimi/minimi a 52 settimane.
 
 Puoi farlo girare in due modi:
 
@@ -14,29 +13,14 @@ Puoi farlo girare in due modi:
    Ha un limite importante: leggi la sezione "Limiti del free tier" prima
    di fidartene per soldi veri.
 
-## 1. Configura il login Google e le mail (obbligatorio in entrambi i casi)
+## 1. Configura il mittente delle mail (obbligatorio in entrambi i casi)
 
-### 1a. Credenziali OAuth "Accedi con Google"
-
-1. Vai su https://console.cloud.google.com/apis/credentials (crea un
-   progetto se non ne hai già uno).
-2. "Configura schermata consenso OAuth" → tipo "Esterno" → compila i campi
-   obbligatori (nome app, email) → salva.
-3. "Crea credenziali" → "ID client OAuth" → tipo applicazione **Web
-   application**.
-4. In "URI di reindirizzamento autorizzati" aggiungi:
-   - `http://localhost:5000/auth/callback` (per test in locale)
-   - `https://<il-tuo-dominio-render>.onrender.com/auth/callback` (per il
-     deploy cloud, aggiungilo dopo il primo deploy quando conosci l'URL)
-5. Copia il **Client ID** e il **Client Secret** generati.
-
-### 1b. Password per le app Gmail (mittente delle mail)
-
-Genera una password per le app su
+Genera una **password per le app** Gmail su
 `https://myaccount.google.com/apppasswords` (richiede la verifica in due
 passaggi attiva). Questo è l'account che **invia** le mail — il
-**destinatario** invece è automaticamente l'email Google di ogni utente che
-fa login.
+**destinatario** è l'email che inserisci direttamente nell'app al primo
+avvio (si può cambiare in qualsiasi momento cliccando sulla tua email in
+alto a destra).
 
 ## 2. Opzione A — Raspberry Pi (always-on reale, gratis)
 
@@ -47,18 +31,15 @@ source venv/bin/activate
 pip install -r requirements.txt
 
 cp .env.example .env
-nano .env   # inserisci GOOGLE_CLIENT_ID/SECRET, CECCHINO_EMAIL_*, SECRET_KEY, PUBLIC_URL
+nano .env   # inserisci CECCHINO_EMAIL_FROM, CECCHINO_EMAIL_PASSWORD, CECCHINO_PUBLIC_URL
 ```
-
-Nel `.env`, imposta `CECCHINO_PUBLIC_URL=http://<IP-DEL-RASPBERRY>:5000` e
-aggiungi lo stesso indirizzo + `/auth/callback` tra gli URI di
-reindirizzamento OAuth (punto 1a). Poi:
 
 ```bash
 python app.py
 ```
 
-Apri da telefono/PC sulla stessa rete: `http://<IP-DEL-RASPBERRY>:5000`.
+Apri da telefono/PC sulla stessa rete: `http://<IP-DEL-RASPBERRY>:5000`,
+inserisci la tua email nella schermata iniziale e sei pronto.
 
 ### Avvio automatico all'accensione (systemd)
 
@@ -106,16 +87,12 @@ GitHub e fa auto-deploy ad ogni push. Non serve carta di credito.
 4. Dopo il primo deploy, apri il servizio → **Environment** e compila i
    valori mancanti (`sync: false` in `render.yaml`):
    - `CECCHINO_EMAIL_FROM`, `CECCHINO_EMAIL_PASSWORD`
-   - `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`
    - `CECCHINO_PUBLIC_URL` → l'URL che Render ti ha assegnato, es.
      `https://cecchino-pro.onrender.com`
-   - `CECCHINO_SECRET_KEY` e `CECCHINO_CRON_SECRET` sono già generati
-     automaticamente da Render (`generateValue: true`); puoi lasciarli.
-5. Torna su Google Cloud Console (punto 1a) e aggiungi
-   `https://cecchino-pro.onrender.com/auth/callback` tra gli URI di
-   reindirizzamento autorizzati.
-6. Render fa un redeploy automatico dopo il cambio env vars. Apri l'URL:
-   dovresti vedere la schermata "Accedi con Google".
+   - `CECCHINO_CRON_SECRET` è già generato automaticamente da Render
+     (`generateValue: true`); puoi lasciarlo.
+5. Render fa un redeploy automatico dopo il cambio env vars. Apri l'URL:
+   dovresti vedere la richiesta della tua email.
 
 ### 3b. Tenerlo sveglio e far girare il tick orario gratis, con GitHub Actions
 
@@ -143,10 +120,11 @@ Configuralo così:
 
 - **Filesystem effimero**: Render (piano free) non garantisce la
   persistenza del disco tra un riavvio/redeploy e l'altro. Il database
-  SQLite (`signals.db`) può azzerarsi, perdendo utenti, portafoglio e
-  storico. Va benissimo per **testare** che tutto funzioni; per un uso
-  reale valuta un database gestito gratuito (es. Render Postgres free per
-  90 giorni, o Supabase Postgres free) al posto di SQLite.
+  SQLite (`signals.db`) può azzerarsi, perdendo email impostata,
+  portafoglio e storico. Va benissimo per **testare** che tutto funzioni;
+  per un uso reale valuta un database gestito gratuito (es. Render
+  Postgres free per 90 giorni, o Supabase Postgres free) al posto di
+  SQLite.
 - **Sleep**: senza il tick di GitHub Actions, il monitor interno gira solo
   mentre il servizio è sveglio.
 - Per un always-on **vero e senza compromessi**, il Raspberry Pi (Opzione
@@ -155,20 +133,19 @@ Configuralo così:
 
 ## Funzionalità
 
-- **Login Google**: ogni utente accede con il proprio account; il
-  portafoglio, gli alert e lo storico sono isolati per utente. Al primo
-  accesso il portafoglio viene precompilato con i titoli di default (MU,
-  ASML, MSFT, SNDK, TSMC) e le relative soglie.
+- **Email per gli alert**: alla prima apertura l'app chiede solo
+  l'indirizzo a cui mandare i segnali BUY/SELL. Si può cambiare in
+  qualsiasi momento toccando l'email in alto a destra.
 - **Scanner**: analisi on-demand di qualsiasi ticker (prezzo, RSI 14, MA50,
   MA200, distanza da massimo/minimo 52 settimane, segnale e motivazioni in
   italiano).
-- **Portafoglio**: titoli tracciati con quantità, prezzo pagato, P&L in € e
-  %, segnale attuale, soglie personali di acquisto/vendita. Aggiornamento
-  automatico ogni ora (thread locale e/o tick esterno) o manuale dal
-  pulsante "Aggiorna prezzi".
+- **Portafoglio**: titoli tracciati (precompilato con MU, ASML, MSFT,
+  SNDK, TSMC) con quantità, prezzo pagato, P&L in € e %, segnale attuale,
+  soglie personali di acquisto/vendita. Aggiornamento automatico ogni ora
+  (thread locale e/o tick esterno) o manuale dal pulsante "Aggiorna
+  prezzi".
 - **Alert**: soglie di prezzo (sopra/sotto) per qualsiasi ticker; quando
-  scattano inviano una mail all'indirizzo Google dell'utente e vengono
-  segnate come "scattato".
+  scattano inviano una mail e vengono segnate come "scattato".
 - **Storico**: ogni cambio di segnale (es. BUY → SELL) su un titolo
   tracciato viene registrato con data, prezzo e motivazione, con
   statistiche riassuntive dei cambi.
@@ -180,8 +157,8 @@ Configuralo così:
   con fallback automatico tra `query1` e `query2.finance.yahoo.com`.
 - Un ticker che fallisce (rete, ticker inesistente, formato dati inatteso)
   non blocca l'analisi degli altri: ogni chiamata è avvolta in try/except.
-- L'autenticazione usa OAuth 2.0 / OpenID Connect con Google tramite
-  Authlib; le sessioni sono firmate con `CECCHINO_SECRET_KEY`.
-- `POST /api/cron/tick` (protetto da `X-Cron-Secret`) aggiorna i segnali di
-  tutti gli utenti: è pensato per essere chiamato da un trigger esterno
-  gratuito (GitHub Actions) quando l'hosting va in sleep.
+- L'app non ha login/password: è pensata per un solo utilizzatore che
+  imposta la propria email di notifica dalla UI.
+- `POST /api/cron/tick` (protetto da `X-Cron-Secret`) aggiorna tutti i
+  segnali: è pensato per essere chiamato da un trigger esterno gratuito
+  (GitHub Actions) quando l'hosting va in sleep.
