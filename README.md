@@ -153,25 +153,65 @@ Configuralo così:
   tracciato viene registrato con data, prezzo e motivazione, con
   statistiche riassuntive dei cambi.
 
+## Se "Impossibile recuperare dati" persiste su hosting cloud
+
+L'app prova **tre** fonti dati in sequenza: Yahoo Finance → Stooq → Twelve
+Data. Le prime due non richiedono configurazione, ma alcuni hosting cloud
+gratuiti (Render incluso) condividono pool di IP che sia Yahoo che Stooq
+a volte bloccano o limitano. Se dopo l'ultimo deploy vedi ancora l'errore
+su **tutti** i titoli, attiva la terza fonte:
+
+1. Registrati gratis (2 minuti, nessuna carta) su https://twelvedata.com
+   e copia la API key dalla dashboard.
+2. Su Render → il tuo servizio → **Environment** → aggiungi
+   `TWELVEDATA_API_KEY` con quel valore → salva (Render fa il redeploy da
+   solo). In locale/Raspberry Pi mettila nel file `.env`.
+3. Ricarica il sito: ora, se Yahoo e Stooq falliscono, l'app usa Twelve
+   Data automaticamente. Il piano free copre 800 richieste/giorno, ampio
+   per un portafoglio di pochi titoli aggiornato ogni ora.
+
+Se vuoi capire *perché* falliscono Yahoo/Stooq invece di limitarti ad
+aggirarlo, guarda i log del servizio (Render → tab **Logs**): ogni
+fallimento ora stampa lo status HTTP esatto restituito (es. `Yahoo
+query1 HTTP 429` = blocco temporaneo per troppe richieste dall'IP
+condiviso).
+
+## Sulle soglie di acquisto/vendita e sull'uso di un'AI esterna
+
+- **Le soglie sono già automatiche**: il segnale BUY/HOLD/SELL non
+  richiede di inserire prezzi a mano. Viene calcolato dall'analisi
+  tecnica (RSI 14, MA50/MA200, distanza dai massimi/minimi a 52
+  settimane, conferma sui volumi) — vedi `compute_signal()` in `app.py`.
+  I campi "soglia acquisto/vendita" nel form Portafoglio sono facoltativi:
+  servono solo se vuoi un avviso extra a un prezzo preciso che scegli tu,
+  non sostituiscono l'analisi automatica.
+- **Un abbonamento ChatGPT Plus/Pro non risolve né aiuta con questa app**:
+  è un prodotto di chat per uso personale, non fornisce un'API né un modo
+  per far girare processi in background — non c'entra con l'affidabilità
+  dei dati di mercato (quello è il problema Yahoo/Stooq sopra) né
+  sostituisce l'analisi tecnica già presente. Se in futuro vuoi che
+  un'AI generi un commento discorsivo in più sopra ai segnali già
+  calcolati, servirebbe una API key a consumo (OpenAI o Anthropic,
+  centesimi al mese per questo volume d'uso) da collegare esplicitamente
+  nel codice: non è implementata di default per non introdurre un costo
+  a tua insaputa.
+
 ## Note tecniche
 
 - I dati di mercato vengono presi dall'endpoint pubblico `chart` di Yahoo
   Finance via `requests` (nessuna libreria `yfinance`), con fallback
-  automatico tra `query1` e `query2.finance.yahoo.com`. Se Yahoo è
-  irraggiungibile (capita su alcuni hosting cloud, che condividono pool di
-  IP a volte limitati da Yahoo) l'app prova automaticamente **Stooq**
-  come seconda fonte gratuita, senza bisogno di configurazione.
+  automatico tra `query1`/`query2.finance.yahoo.com`, poi Stooq, poi
+  Twelve Data (se configurata) — vedi sezione sopra.
+- Il segnale usa anche i volumi: uno spike di volume (>1.8x la media a 20
+  giorni) che conferma la direzione del prezzo del giorno rafforza o
+  indebolisce lo score. Nella card di analisi vedi anche le "zone"
+  acquisto/vendita 🤖, calcolate automaticamente dal range a 52 settimane.
 - La ricerca ticker unisce un elenco locale di ~70 titoli comuni (sempre
   disponibile, istantaneo) ai risultati live della ricerca Yahoo quando
   raggiungibile — quindi i suggerimenti funzionano anche se Yahoo è
   bloccato, solo con una copertura più limitata.
 - Un ticker che fallisce (rete, ticker inesistente, formato dati inatteso)
   non blocca l'analisi degli altri: ogni chiamata è avvolta in try/except.
-- Se su un deploy cloud vedi "Impossibile recuperare dati" per **tutti**
-  i titoli (anche per uno enorme e liquido come MSFT), è quasi certamente
-  Yahoo che blocca l'IP condiviso di quell'hosting: controlla i log del
-  servizio, dove ora viene stampato lo status HTTP esatto restituito da
-  Yahoo per capire se è un blocco temporaneo (429) o altro.
 - L'app non ha login/password: è pensata per un solo utilizzatore che
   imposta la propria email di notifica dalla UI.
 - `POST /api/cron/tick` (protetto da `X-Cron-Secret`) aggiorna tutti i

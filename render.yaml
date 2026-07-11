@@ -17,3 +17,5 @@ services:
         sync: false
       - key: CECCHINO_PUBLIC_URL
         sync: false
+      - key: TWELVEDATA_API_KEY
+        sync: false

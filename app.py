@@ -196,12 +196,18 @@ def fetch_yahoo(ticker):
                 continue
             j = r.json()
             result = j["chart"]["result"][0]
-            closes = [c for c in result["indicators"]["quote"][0]["close"] if c]
-            if not closes:
+            quote = result["indicators"]["quote"][0]
+            raw_closes = quote.get("close", [])
+            raw_volumes = quote.get("volume", [])
+            paired = [(c, v or 0) for c, v in zip(raw_closes, raw_volumes) if c]
+            if not paired:
                 continue
+            closes = [p[0] for p in paired]
+            volumes = [p[1] for p in paired]
             meta = result["meta"]
             return {
                 "closes": closes,
+                "volumes": volumes,
                 "price": float(meta.get("regularMarketPrice", closes[-1])),
                 "currency": meta.get("currency", "USD"),
                 "name": meta.get("shortName", ticker),
@@ -221,20 +227,24 @@ def fetch_stooq(ticker):
         url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
         r = requests.get(url, headers=YAHOO_HEADERS, timeout=12)
         if r.status_code != 200 or not r.text.startswith("Date,"):
+            print(f"Stooq HTTP {r.status_code} per {ticker}: {r.text[:120]!r}")
             return None
-        closes = []
+        closes, volumes = [], []
         for line in r.text.strip().splitlines()[1:]:
             parts = line.split(",")
-            if len(parts) >= 5:
+            if len(parts) >= 6:
                 try:
                     closes.append(float(parts[4]))
+                    volumes.append(float(parts[5]))
                 except ValueError:
                     continue
         closes = closes[-504:]  # circa 2 anni di sedute
+        volumes = volumes[-504:]
         if len(closes) < 2:
             return None
         return {
             "closes": closes,
+            "volumes": volumes,
             "price": closes[-1],
             "currency": "USD",
             "name": ticker.upper(),
@@ -244,9 +254,53 @@ def fetch_stooq(ticker):
         return None
 
 
+def fetch_twelvedata(ticker):
+    """Terzo fallback, con API key gratuita (twelvedata.com). Usato solo se
+    TWELVEDATA_API_KEY è impostata: utile quando l'hosting cloud ha l'IP
+    bloccato sia da Yahoo che da Stooq (capita su alcuni piani gratuiti)."""
+    if not config.TWELVEDATA_API_KEY:
+        return None
+    try:
+        url = "https://api.twelvedata.com/time_series"
+        params = {
+            "symbol": ticker,
+            "interval": "1day",
+            "outputsize": 260,
+            "apikey": config.TWELVEDATA_API_KEY,
+        }
+        r = requests.get(url, params=params, timeout=12)
+        if r.status_code != 200:
+            print(f"Twelve Data HTTP {r.status_code} per {ticker}: {r.text[:200]!r}")
+            return None
+        j = r.json()
+        if j.get("status") == "error" or "values" not in j:
+            print(f"Twelve Data errore per {ticker}: {j.get('message', j)}")
+            return None
+        values = list(reversed(j["values"]))  # dal più vecchio al più recente
+        closes, volumes = [], []
+        for v in values:
+            try:
+                closes.append(float(v["close"]))
+                volumes.append(float(v.get("volume") or 0))
+            except (TypeError, ValueError, KeyError):
+                continue
+        if len(closes) < 2:
+            return None
+        return {
+            "closes": closes,
+            "volumes": volumes,
+            "price": closes[-1],
+            "currency": "USD",
+            "name": ticker.upper(),
+        }
+    except Exception as e:
+        print(f"Twelve Data fallito per {ticker}: {e}")
+        return None
+
+
 def fetch_market_data(ticker):
-    """Yahoo come fonte primaria, Stooq come riserva se Yahoo è irraggiungibile."""
-    return fetch_yahoo(ticker) or fetch_stooq(ticker)
+    """Yahoo come fonte primaria, poi Stooq, poi Twelve Data (se configurata)."""
+    return fetch_yahoo(ticker) or fetch_stooq(ticker) or fetch_twelvedata(ticker)
 
 
 # --------------------------------------------------------------------------
@@ -385,8 +439,11 @@ def compute_rsi(closes, period=14):
     return 100 - (100 / (1 + rs))
 
 
-def compute_signal(closes, price, custom_buy=None, custom_sell=None):
-    """Calcola segnale BUY/HOLD/SELL, score -100/+100 e motivazioni in italiano."""
+def compute_signal(closes, price, custom_buy=None, custom_sell=None, volumes=None):
+    """Calcola segnale BUY/HOLD/SELL, score -100/+100 e motivazioni in italiano.
+    Tutto è automatico (RSI, medie mobili, massimi/minimi 52W, volumi): le
+    soglie personali sono solo un avviso extra opzionale, non governano il
+    segnale principale."""
     score = 0
     reasons = []
 
@@ -443,6 +500,22 @@ def compute_signal(closes, price, custom_buy=None, custom_sell=None):
             score += 20
             reasons.append(f"Calo {day_chg:.1f}% oggi — possibile dip da comprare")
 
+    vol_ratio = None
+    if volumes and len(volumes) >= 11:
+        avg_vol20 = statistics.mean(volumes[-21:-1]) if len(volumes) >= 21 else statistics.mean(volumes[:-1])
+        last_vol = volumes[-1]
+        if avg_vol20 > 0:
+            vol_ratio = last_vol / avg_vol20
+            if vol_ratio > 1.8 and day_chg > 2:
+                score += 10
+                reasons.append(f"Volume {vol_ratio:.1f}x la media — conferma rialzista")
+            elif vol_ratio > 1.8 and day_chg < -2:
+                score -= 10
+                reasons.append(f"Volume {vol_ratio:.1f}x la media — conferma ribassista")
+
+    # Soglie personali: solo un avviso extra facoltativo che l'utente può
+    # impostare a piacere, non sono richieste (il segnale sopra è già
+    # calcolato in automatico dall'analisi tecnica).
     if custom_buy and price <= custom_buy:
         score += 45
         reasons.append(f"⭐ SOTTO LA TUA SOGLIA DI ACQUISTO ({custom_buy})")
@@ -472,6 +545,11 @@ def compute_signal(closes, price, custom_buy=None, custom_sell=None):
         "dist_high52": round(dist_from_high, 1),
         "dist_low52": round((price - low52) / low52 * 100, 1) if low52 else 0.0,
         "day_chg": round(day_chg, 1),
+        "vol_ratio": round(vol_ratio, 2) if vol_ratio is not None else None,
+        # Zone di supporto/resistenza calcolate in automatico dal range a 52
+        # settimane: usate come suggerimento se l'utente non imposta soglie sue.
+        "suggested_buy": round(low52 * 1.05, 2),
+        "suggested_sell": round(high52 * 0.97, 2),
     }
 
 
@@ -482,7 +560,9 @@ def analyze_ticker(ticker, custom_buy=None, custom_sell=None):
         if not data or len(data["closes"]) < 2:
             return {"ticker": ticker, "error": f"Impossibile recuperare dati per {ticker}"}
 
-        sig = compute_signal(data["closes"], data["price"], custom_buy, custom_sell)
+        sig = compute_signal(
+            data["closes"], data["price"], custom_buy, custom_sell, data.get("volumes")
+        )
         result = {
             "ticker": ticker,
             "name": data["name"],
@@ -1085,8 +1165,9 @@ nav.bottom button.active { color: var(--blue); }
         </div>
         <input id="pf-qty" placeholder="Quantità" type="number" step="any">
         <input id="pf-paid" placeholder="Totale pagato €" type="number" step="any">
-        <input id="pf-buy" placeholder="Soglia acquisto" type="number" step="any">
-        <input id="pf-sell" placeholder="Soglia vendita" type="number" step="any">
+        <input id="pf-buy" placeholder="Soglia acquisto (opzionale)" type="number" step="any">
+        <input id="pf-sell" placeholder="Soglia vendita (opzionale)" type="number" step="any">
+        <div class="dim full" style="font-size:12px">🤖 Il segnale BUY/HOLD/SELL è già calcolato in automatico dall'analisi tecnica (RSI, medie mobili, massimi/minimi 52 settimane, volumi). Le soglie qui sopra sono solo un avviso extra a un prezzo preciso, se vuoi: lasciale vuote e ci pensa l'algoritmo.</div>
         <button class="full" onclick="addToPortfolio()">Salva</button>
       </div>
     </div>
@@ -1260,6 +1341,9 @@ function renderAnalysisCard(a, extraButtons) {
       <div class="metric"><div class="val">${a.score}</div><div class="lbl">Score</div></div>
       <div class="metric"><div class="val">${a.dist_high52}%</div><div class="lbl">da Max 52W</div></div>
       <div class="metric"><div class="val">${a.dist_low52}%</div><div class="lbl">da Min 52W</div></div>
+      <div class="metric"><div class="val">${a.vol_ratio != null ? a.vol_ratio + 'x' : '—'}</div><div class="lbl">Volume/media</div></div>
+      <div class="metric"><div class="val">${a.suggested_buy}</div><div class="lbl">Zona acquisto 🤖</div></div>
+      <div class="metric"><div class="val">${a.suggested_sell}</div><div class="lbl">Zona vendita 🤖</div></div>
       <div class="metric"><div class="val">${a.updated.slice(11,16)}</div><div class="lbl">Aggiornato</div></div>
     </div>`;
   const reasons = `<div class="reasons">${a.reasons.map(r => `<div>• ${r}</div>`).join('')}</div>`;
