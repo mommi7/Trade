@@ -304,6 +304,41 @@ def fetch_market_data(ticker):
 
 
 # --------------------------------------------------------------------------
+# Commento AI opzionale (Google Gemini, free tier senza carta di credito)
+# --------------------------------------------------------------------------
+def generate_ai_commentary(ticker, result):
+    """Sintesi in italiano generata da un LLM sopra ai dati tecnici già
+    calcolati. Puramente opzionale: se GEMINI_API_KEY non è impostata non fa
+    nessuna chiamata di rete e ritorna None senza rallentare nulla."""
+    if not config.GEMINI_API_KEY:
+        return None
+    try:
+        prompt = (
+            "Sei un assistente che spiega in italiano, in 2-3 frasi semplici e dirette "
+            "(niente disclaimer legali, niente ripetizioni), perché un titolo ha ricevuto "
+            f"questo segnale di trading. Ticker: {ticker}. Segnale: {result['signal']} "
+            f"(score {result['score']}/100). Prezzo: {result['price']} {result['currency']} "
+            f"({result['day_chg']:+.1f}% oggi). RSI14: {result['rsi']}. MA50: {result['ma50']}. "
+            f"MA200: {result['ma200']}. Distanza dal massimo 52 settimane: {result['dist_high52']}%. "
+            f"Motivazioni tecniche già calcolate: {'; '.join(result['reasons']) or 'nessuna in particolare'}."
+        )
+        url = (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            f"gemini-2.0-flash:generateContent?key={config.GEMINI_API_KEY}"
+        )
+        r = requests.post(url, json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=15)
+        if r.status_code != 200:
+            print(f"Gemini HTTP {r.status_code} per {ticker}: {r.text[:200]!r}")
+            return None
+        j = r.json()
+        text = j["candidates"][0]["content"]["parts"][0]["text"]
+        return text.strip()
+    except Exception as e:
+        print(f"Gemini fallito per {ticker}: {e}")
+        return None
+
+
+# --------------------------------------------------------------------------
 # Ricerca ticker per suggerimenti (Scanner / Portafoglio / Alert)
 # --------------------------------------------------------------------------
 # Elenco locale di titoli comuni: garantisce suggerimenti istantanei anche
@@ -571,6 +606,7 @@ def analyze_ticker(ticker, custom_buy=None, custom_sell=None):
             "updated": datetime.now().isoformat(timespec="seconds"),
             **sig,
         }
+        result["ai_commentary"] = generate_ai_commentary(ticker, result)
         return result
     except Exception as e:
         print(f"Errore analisi {ticker}: {e}")
@@ -1030,6 +1066,16 @@ h1 { font-size: 20px; margin: 6px 0 16px 0; }
 .reasons { margin-top: 10px; font-size: 13px; color: var(--text); line-height: 1.5; }
 .reasons div { margin-bottom: 2px; }
 
+.ai-note {
+  margin-top: 10px;
+  padding: 10px;
+  background: rgba(59,130,246,0.10);
+  border: 1px solid rgba(59,130,246,0.3);
+  border-radius: 8px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
 input, select, button {
   font-size: 15px;
   border-radius: 8px;
@@ -1346,6 +1392,7 @@ function renderAnalysisCard(a, extraButtons) {
       <div class="metric"><div class="val">${a.updated.slice(11,16)}</div><div class="lbl">Aggiornato</div></div>
     </div>`;
   const reasons = `<div class="reasons">${a.reasons.map(r => `<div>• ${r}</div>`).join('')}</div>`;
+  const aiNote = a.ai_commentary ? `<div class="ai-note">🤖 <b>AI:</b> ${a.ai_commentary}</div>` : '';
   return `
     <div class="card stripe ${a.signal}">
       <div class="row">
@@ -1357,6 +1404,7 @@ function renderAnalysisCard(a, extraButtons) {
       </div>
       ${metrics}
       ${reasons}
+      ${aiNote}
       ${extraButtons || ''}
     </div>`;
 }

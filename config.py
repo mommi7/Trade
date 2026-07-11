@@ -33,6 +33,12 @@ PUBLIC_URL = os.environ.get("CECCHINO_PUBLIC_URL", "http://localhost:5000")
 # 800 richieste/giorno). Lasciala vuota per non usarla.
 TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY", "")
 
+# Commento AI opzionale sopra ogni segnale (facoltativo). Usa la API
+# gratuita di Google Gemini (https://aistudio.google.com/apikey — free
+# tier senza carta di credito). Lasciala vuota per non usarla: l'app
+# funziona comunque, il commento AI è solo un testo in più.
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+
 # NB: il ticker Yahoo/NYSE di Taiwan Semiconductor è "TSM", non "TSMC"
 # ("TSMC" non è un simbolo valido su nessun mercato e fallirebbe sempre).
 DEFAULT_TICKERS = ["MU", "ASML", "MSFT", "SNDK", "TSM"]

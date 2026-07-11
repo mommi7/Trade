@@ -19,3 +19,5 @@ services:
         sync: false
       - key: TWELVEDATA_API_KEY
         sync: false
+      - key: GEMINI_API_KEY
+        sync: false

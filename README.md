@@ -163,9 +163,14 @@ su **tutti** i titoli, attiva la terza fonte:
 
 1. Registrati gratis (2 minuti, nessuna carta) su https://twelvedata.com
    e copia la API key dalla dashboard.
-2. Su Render → il tuo servizio → **Environment** → aggiungi
-   `TWELVEDATA_API_KEY` con quel valore → salva (Render fa il redeploy da
-   solo). In locale/Raspberry Pi mettila nel file `.env`.
+2. Su Render → il tuo servizio (o l'Environment Group collegato) →
+   **Environment** → aggiungi una variabile chiamata **esattamente**
+   `TWELVEDATA_API_KEY` (tutto maiuscolo, con l'underscore) col valore
+   copiato → salva. **Il nome deve combaciare alla lettera**: una
+   variabile chiamata ad es. `twelvedata` o `Twelvedata_Api_Key` non
+   viene letta dal codice e la chiave resta di fatto disattivata, anche
+   se il valore è corretto. In locale/Raspberry Pi mettila nel file
+   `.env` con lo stesso nome esatto.
 3. Ricarica il sito: ora, se Yahoo e Stooq falliscono, l'app usa Twelve
    Data automaticamente. Il piano free copre 800 richieste/giorno, ampio
    per un portafoglio di pochi titoli aggiornato ogni ora.
@@ -176,25 +181,30 @@ fallimento ora stampa lo status HTTP esatto restituito (es. `Yahoo
 query1 HTTP 429` = blocco temporaneo per troppe richieste dall'IP
 condiviso).
 
-## Sulle soglie di acquisto/vendita e sull'uso di un'AI esterna
+## Collegare un'AI gratuita (commento discorsivo sopra i segnali)
 
-- **Le soglie sono già automatiche**: il segnale BUY/HOLD/SELL non
-  richiede di inserire prezzi a mano. Viene calcolato dall'analisi
-  tecnica (RSI 14, MA50/MA200, distanza dai massimi/minimi a 52
-  settimane, conferma sui volumi) — vedi `compute_signal()` in `app.py`.
-  I campi "soglia acquisto/vendita" nel form Portafoglio sono facoltativi:
-  servono solo se vuoi un avviso extra a un prezzo preciso che scegli tu,
-  non sostituiscono l'analisi automatica.
-- **Un abbonamento ChatGPT Plus/Pro non risolve né aiuta con questa app**:
-  è un prodotto di chat per uso personale, non fornisce un'API né un modo
-  per far girare processi in background — non c'entra con l'affidabilità
-  dei dati di mercato (quello è il problema Yahoo/Stooq sopra) né
-  sostituisce l'analisi tecnica già presente. Se in futuro vuoi che
-  un'AI generi un commento discorsivo in più sopra ai segnali già
-  calcolati, servirebbe una API key a consumo (OpenAI o Anthropic,
-  centesimi al mese per questo volume d'uso) da collegare esplicitamente
-  nel codice: non è implementata di default per non introdurre un costo
-  a tua insaputa.
+- **Un abbonamento ChatGPT Plus/Pro non serve e non si collega a
+  quest'app**: è un prodotto di chat per uso personale, non un'API — non
+  fornisce un modo per far girare chiamate automatiche da un server. Per
+  collegare un'AI a un'app serve sempre una **API key** a parte.
+- **Google Gemini ha un'API gratuita vera**, senza carta di credito:
+  1. Vai su https://aistudio.google.com/apikey, accedi con un account
+     Google, clicca "Create API key" e copiala.
+  2. Su Render → Environment → aggiungi una variabile chiamata
+     **esattamente** `GEMINI_API_KEY` (stesso discorso di sopra sul nome
+     preciso) col valore copiato → salva. In locale/Raspberry Pi:
+     stesso nome nel file `.env`.
+  3. Ricarica il sito: ora ogni analisi (Scanner e Portafoglio) include
+     in fondo alla card un riquadro "🤖 AI" con 2-3 frasi generate che
+     spiegano il segnale in linguaggio naturale, oltre ai motivi tecnici
+     già elencati sopra.
+  4. Se non imposti questa chiave l'app funziona lo stesso, identica a
+     prima: il commento AI è solo un extra facoltativo, non governa il
+     segnale BUY/HOLD/SELL (quello resta calcolato da RSI/medie
+     mobili/52 settimane/volumi, sempre attivo).
+- Le soglie di acquisto/vendita **sono già automatiche** e non richiedono
+  di inserire prezzi a mano: i campi nel form Portafoglio sono solo un
+  avviso extra facoltativo a un prezzo preciso che scegli tu.
 
 ## Note tecniche
 
@@ -206,6 +216,9 @@ condiviso).
   giorni) che conferma la direzione del prezzo del giorno rafforza o
   indebolisce lo score. Nella card di analisi vedi anche le "zone"
   acquisto/vendita 🤖, calcolate automaticamente dal range a 52 settimane.
+- Il commento AI (Google Gemini, opzionale) è puramente aggiuntivo: se
+  `GEMINI_API_KEY` non è impostata non fa nessuna chiamata di rete e
+  l'app si comporta esattamente come senza questa funzione.
 - La ricerca ticker unisce un elenco locale di ~70 titoli comuni (sempre
   disponibile, istantaneo) ai risultati live della ricerca Yahoo quando
   raggiungibile — quindi i suggerimenti funzionano anche se Yahoo è
