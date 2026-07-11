@@ -990,9 +990,8 @@ h1 { font-size: 20px; margin: 6px 0 16px 0; }
   padding: 14px;
   margin-bottom: 12px;
   position: relative;
-  overflow: hidden;
 }
-.card.stripe { padding-left: 18px; }
+.card.stripe { padding-left: 18px; overflow: hidden; }
 .card.stripe::before {
   content: "";
   position: absolute;
