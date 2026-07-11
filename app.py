@@ -1,12 +1,15 @@
 """
 Cecchino Pro - sistema di trading signal monitoring.
 
-App Flask unica: espone una pagina web (mobile-first, tema scuro) e delle
-API JSON per Scanner, Portafoglio, Alert e Storico. Un thread in background
-analizza i titoli del portafoglio ogni ora, aggiorna lo storico dei segnali
-e invia una mail quando un segnale cambia o un alert scatta.
+App Flask multi-utente: login con Google, poi Scanner, Portafoglio, Alert e
+Storico. Ogni utente vede solo i propri titoli e riceve le mail di alert
+al proprio indirizzo Google. Un endpoint /api/cron/tick permette a un
+trigger esterno gratuito (es. GitHub Actions) di far girare il controllo
+orario anche quando l'app è ospitata su un servizio cloud gratuito che va
+in sleep.
 """
 import json
+import os
 import smtplib
 import sqlite3
 import ssl
@@ -15,9 +18,12 @@ import threading
 import time
 from datetime import datetime
 from email.message import EmailMessage
+from functools import wraps
 
 import requests
-from flask import Flask, jsonify, render_template_string, request
+from authlib.integrations.flask_client import OAuth
+from flask import Flask, jsonify, redirect, render_template_string, request, session, url_for
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 import config
 
@@ -25,8 +31,23 @@ DB_PATH = "signals.db"
 YAHOO_HEADERS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) Chrome/120"}
 
 app = Flask(__name__)
+app.secret_key = config.SECRET_KEY
+app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
+app.config.update(
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=bool(os.environ.get("RENDER")),
+)
 
-# Cache in memoria dell'ultima analisi calcolata per ogni ticker attivo,
+oauth = OAuth(app)
+google = oauth.register(
+    name="google",
+    client_id=config.GOOGLE_CLIENT_ID,
+    client_secret=config.GOOGLE_CLIENT_SECRET,
+    server_metadata_url="https://accounts.google.com/.well-known/openid-configuration",
+    client_kwargs={"scope": "openid email profile"},
+)
+
+# Cache in memoria dell'ultima analisi calcolata per ogni (utente, ticker),
 # così le API leggono dati già pronti invece di richiamare Yahoo ad ogni click.
 LAST_ANALYSIS = {}
 CACHE_LOCK = threading.Lock()
@@ -38,6 +59,7 @@ CACHE_LOCK = threading.Lock()
 def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
 
@@ -45,18 +67,29 @@ def init_db():
     conn = get_db()
     conn.executescript(
         """
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY,
+            google_sub TEXT UNIQUE,
+            email TEXT UNIQUE,
+            name TEXT,
+            created DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+
         CREATE TABLE IF NOT EXISTS tickers (
             id INTEGER PRIMARY KEY,
-            ticker TEXT UNIQUE,
+            user_id INTEGER NOT NULL REFERENCES users(id),
+            ticker TEXT,
             qty REAL DEFAULT 0,
             paid REAL DEFAULT 0,
             custom_buy REAL,
             custom_sell REAL,
-            active INTEGER DEFAULT 1
+            active INTEGER DEFAULT 1,
+            UNIQUE(user_id, ticker)
         );
 
         CREATE TABLE IF NOT EXISTS signals (
             id INTEGER PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES users(id),
             ticker TEXT,
             signal TEXT,
             price REAL,
@@ -68,6 +101,7 @@ def init_db():
 
         CREATE TABLE IF NOT EXISTS alerts (
             id INTEGER PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES users(id),
             ticker TEXT,
             condition TEXT,
             price REAL,
@@ -77,25 +111,84 @@ def init_db():
         """
     )
     conn.commit()
+    conn.close()
 
-    # Seed dei ticker di default solo se la tabella è vuota (prima esecuzione).
-    row = conn.execute("SELECT COUNT(*) AS n FROM tickers").fetchone()
-    if row["n"] == 0:
-        for t in config.DEFAULT_TICKERS:
-            levels = config.DEFAULT_LEVELS.get(t, {})
-            conn.execute(
-                "INSERT INTO tickers (ticker, qty, paid, custom_buy, custom_sell, active) "
-                "VALUES (?, ?, ?, ?, ?, 1)",
-                (
-                    t,
-                    levels.get("qty", 0),
-                    levels.get("paid", 0),
-                    levels.get("buy"),
-                    levels.get("sell"),
-                ),
-            )
+
+def seed_default_tickers(conn, user_id):
+    """Precompila il portafoglio di un nuovo utente con i titoli di default."""
+    for t in config.DEFAULT_TICKERS:
+        levels = config.DEFAULT_LEVELS.get(t, {})
+        conn.execute(
+            "INSERT OR IGNORE INTO tickers (user_id, ticker, qty, paid, custom_buy, custom_sell, active) "
+            "VALUES (?, ?, ?, ?, ?, ?, 1)",
+            (
+                user_id,
+                t,
+                levels.get("qty", 0),
+                levels.get("paid", 0),
+                levels.get("buy"),
+                levels.get("sell"),
+            ),
+        )
+    conn.commit()
+
+
+# --------------------------------------------------------------------------
+# Login con Google
+# --------------------------------------------------------------------------
+def login_required(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if "user_id" not in session:
+            return jsonify({"error": "Non autenticato"}), 401
+        return f(*args, **kwargs)
+
+    return wrapper
+
+
+@app.route("/login")
+def login():
+    redirect_uri = url_for("auth_callback", _external=True)
+    return google.authorize_redirect(redirect_uri)
+
+
+@app.route("/auth/callback")
+def auth_callback():
+    token = google.authorize_access_token()
+    userinfo = token.get("userinfo")
+    if not userinfo:
+        return "Login con Google fallito.", 400
+
+    google_sub = userinfo["sub"]
+    email = userinfo["email"]
+    name = userinfo.get("name", email)
+
+    conn = get_db()
+    row = conn.execute("SELECT * FROM users WHERE google_sub = ?", (google_sub,)).fetchone()
+    if row is None:
+        cur = conn.execute(
+            "INSERT INTO users (google_sub, email, name) VALUES (?, ?, ?)",
+            (google_sub, email, name),
+        )
+        conn.commit()
+        user_id = cur.lastrowid
+        seed_default_tickers(conn, user_id)
+    else:
+        user_id = row["id"]
+        conn.execute("UPDATE users SET email = ?, name = ? WHERE id = ?", (email, name, user_id))
         conn.commit()
     conn.close()
+
+    session["user_id"] = user_id
+    session["email"] = email
+    session["name"] = name
+    return redirect("/")
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect("/")
 
 
 # --------------------------------------------------------------------------
@@ -265,15 +358,18 @@ def analyze_ticker(ticker, custom_buy=None, custom_sell=None):
 # --------------------------------------------------------------------------
 # Email
 # --------------------------------------------------------------------------
-def send_mail(subject, body):
+def send_mail(to_email, subject, body):
     if not config.EMAIL_FROM or not config.EMAIL_PASSWORD:
-        print(f"Mail non inviata (credenziali mancanti): {subject}")
+        print(f"Mail non inviata (credenziali mittente mancanti): {subject}")
+        return
+    if not to_email:
+        print(f"Mail non inviata (nessun destinatario): {subject}")
         return
     try:
         msg = EmailMessage()
         msg["Subject"] = subject
         msg["From"] = config.EMAIL_FROM
-        msg["To"] = config.EMAIL_TO
+        msg["To"] = to_email
         msg.set_content(body)
 
         ctx = ssl.create_default_context()
@@ -284,11 +380,7 @@ def send_mail(subject, body):
         print(f"Errore invio mail: {e}")
 
 
-def base_url_hint():
-    return "http://<ip-del-tuo-raspberry>:5000"
-
-
-def notify_signal_change(ticker, old_signal, new_result):
+def notify_signal_change(to_email, ticker, old_signal, new_result):
     subject = f"🎯 CECCHINO: {ticker} {old_signal} → {new_result['signal']}"
     reasons_txt = "\n".join(f"• {r}" for r in new_result["reasons"])
     body = (
@@ -299,39 +391,40 @@ def notify_signal_change(ticker, old_signal, new_result):
         f"RSI: {new_result['rsi']}\n"
         f"Score: {new_result['score']}\n"
         f"Motivazioni:\n{reasons_txt}\n\n"
-        f"Apri Cecchino: {base_url_hint()}"
+        f"Apri Cecchino: {config.PUBLIC_URL}"
     )
-    send_mail(subject, body)
+    send_mail(to_email, subject, body)
 
 
-def notify_alert(ticker, condition, threshold, price):
+def notify_alert(to_email, ticker, condition, threshold, price):
     label = "sopra" if condition == "above" else "sotto"
     subject = f"🔔 CECCHINO ALERT: {ticker} {label} {threshold}"
     body = (
         f"Ticker: {ticker}\n"
         f"Condizione: prezzo {label} {threshold}\n"
         f"Prezzo attuale: {price}\n\n"
-        f"Apri Cecchino: {base_url_hint()}"
+        f"Apri Cecchino: {config.PUBLIC_URL}"
     )
-    send_mail(subject, body)
+    send_mail(to_email, subject, body)
 
 
 # --------------------------------------------------------------------------
 # Storico segnali + Alert
 # --------------------------------------------------------------------------
-def record_signal_if_changed(conn, ticker, result):
+def record_signal_if_changed(conn, user_id, to_email, ticker, result):
     """Se il segnale è cambiato rispetto all'ultimo registrato, lo salva e invia mail."""
     last = conn.execute(
-        "SELECT signal FROM signals WHERE ticker = ? ORDER BY timestamp DESC LIMIT 1",
-        (ticker,),
+        "SELECT signal FROM signals WHERE user_id = ? AND ticker = ? ORDER BY timestamp DESC LIMIT 1",
+        (user_id, ticker),
     ).fetchone()
     old_signal = last["signal"] if last else None
 
     if old_signal != result["signal"]:
         conn.execute(
-            "INSERT INTO signals (ticker, signal, price, score, rsi, reasons) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO signals (user_id, ticker, signal, price, score, rsi, reasons) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
+                user_id,
                 ticker,
                 result["signal"],
                 result["price"],
@@ -342,12 +435,13 @@ def record_signal_if_changed(conn, ticker, result):
         )
         conn.commit()
         if old_signal is not None:
-            notify_signal_change(ticker, old_signal, result)
+            notify_signal_change(to_email, ticker, old_signal, result)
 
 
-def check_alerts(conn, ticker, price):
+def check_alerts(conn, user_id, to_email, ticker, price):
     rows = conn.execute(
-        "SELECT * FROM alerts WHERE ticker = ? AND triggered = 0", (ticker,)
+        "SELECT * FROM alerts WHERE user_id = ? AND ticker = ? AND triggered = 0",
+        (user_id, ticker),
     ).fetchall()
     for a in rows:
         hit = (a["condition"] == "above" and price >= a["price"]) or (
@@ -356,45 +450,74 @@ def check_alerts(conn, ticker, price):
         if hit:
             conn.execute("UPDATE alerts SET triggered = 1 WHERE id = ?", (a["id"],))
             conn.commit()
-            notify_alert(ticker, a["condition"], a["price"], price)
+            notify_alert(to_email, ticker, a["condition"], a["price"], price)
 
 
-def analyze_and_store(ticker, custom_buy, custom_sell):
-    """Analizza un ticker del portafoglio, aggiorna cache, storico ed alert."""
+def analyze_and_store(user_id, to_email, ticker, custom_buy, custom_sell):
+    """Analizza un ticker del portafoglio di un utente, aggiorna cache, storico ed alert."""
     result = analyze_ticker(ticker, custom_buy, custom_sell)
     with CACHE_LOCK:
-        LAST_ANALYSIS[ticker] = result
+        LAST_ANALYSIS[(user_id, ticker)] = result
 
     if "error" in result:
         return result
 
     conn = get_db()
     try:
-        record_signal_if_changed(conn, ticker, result)
-        check_alerts(conn, ticker, result["price"])
+        record_signal_if_changed(conn, user_id, to_email, ticker, result)
+        check_alerts(conn, user_id, to_email, ticker, result["price"])
     finally:
         conn.close()
     return result
 
 
 # --------------------------------------------------------------------------
-# Monitor in background (ogni ora)
+# Monitor (ogni ora via thread locale, oppure via /api/cron/tick esterno)
 # --------------------------------------------------------------------------
 def refresh_all_portfolio():
+    """Aggiorna i titoli attivi di TUTTI gli utenti. Usato dal thread e dal cron esterno."""
     conn = get_db()
     try:
-        rows = conn.execute("SELECT * FROM tickers WHERE active = 1").fetchall()
+        rows = conn.execute(
+            "SELECT t.*, u.email AS user_email FROM tickers t "
+            "JOIN users u ON u.id = t.user_id WHERE t.active = 1"
+        ).fetchall()
     finally:
         conn.close()
 
     for row in rows:
         try:
-            analyze_and_store(row["ticker"], row["custom_buy"], row["custom_sell"])
+            analyze_and_store(
+                row["user_id"], row["user_email"], row["ticker"], row["custom_buy"], row["custom_sell"]
+            )
         except Exception as e:
-            print(f"Errore aggiornamento {row['ticker']}: {e}")
+            print(f"Errore aggiornamento {row['ticker']} (user {row['user_id']}): {e}")
+
+
+def refresh_user_portfolio(user_id):
+    """Aggiorna solo i titoli attivi di UN utente (usato dal pulsante manuale)."""
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT t.*, u.email AS user_email FROM tickers t "
+            "JOIN users u ON u.id = t.user_id WHERE t.active = 1 AND t.user_id = ?",
+            (user_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    for row in rows:
+        try:
+            analyze_and_store(
+                row["user_id"], row["user_email"], row["ticker"], row["custom_buy"], row["custom_sell"]
+            )
+        except Exception as e:
+            print(f"Errore aggiornamento {row['ticker']} (user {row['user_id']}): {e}")
 
 
 def monitor_loop():
+    """Thread di riserva per esecuzioni locali/24-7 reali (es. Raspberry Pi).
+    Su hosting cloud gratuito che va in sleep, usa /api/cron/tick invece."""
     time.sleep(10)  # Attende l'avvio di Flask
     while True:
         try:
@@ -406,21 +529,50 @@ def monitor_loop():
         time.sleep(3600)
 
 
+_monitor_started = False
+
+
+def start_background_monitor():
+    global _monitor_started
+    with CACHE_LOCK:
+        if _monitor_started:
+            return
+        _monitor_started = True
+    threading.Thread(target=monitor_loop, daemon=True).start()
+
+
+# --------------------------------------------------------------------------
+# API - Cron esterno (GitHub Actions o altro, gratuito, per il tick orario)
+# --------------------------------------------------------------------------
+@app.route("/api/cron/tick", methods=["POST"])
+def api_cron_tick():
+    secret = request.headers.get("X-Cron-Secret", "")
+    if not config.CRON_SECRET or secret != config.CRON_SECRET:
+        return jsonify({"error": "unauthorized"}), 401
+    refresh_all_portfolio()
+    return jsonify({"ok": True})
+
+
 # --------------------------------------------------------------------------
 # API - Portafoglio
 # --------------------------------------------------------------------------
 @app.route("/api/portfolio", methods=["GET"])
+@login_required
 def api_portfolio_list():
+    user_id = session["user_id"]
+    to_email = session["email"]
     conn = get_db()
-    rows = conn.execute("SELECT * FROM tickers WHERE active = 1 ORDER BY ticker").fetchall()
+    rows = conn.execute(
+        "SELECT * FROM tickers WHERE user_id = ? AND active = 1 ORDER BY ticker", (user_id,)
+    ).fetchall()
     conn.close()
 
     out = []
     for row in rows:
         with CACHE_LOCK:
-            cached = LAST_ANALYSIS.get(row["ticker"])
+            cached = LAST_ANALYSIS.get((user_id, row["ticker"]))
         if cached is None:
-            cached = analyze_and_store(row["ticker"], row["custom_buy"], row["custom_sell"])
+            cached = analyze_and_store(user_id, to_email, row["ticker"], row["custom_buy"], row["custom_sell"])
 
         item = dict(row)
         item["analysis"] = cached
@@ -438,7 +590,10 @@ def api_portfolio_list():
 
 
 @app.route("/api/portfolio", methods=["POST"])
+@login_required
 def api_portfolio_add():
+    user_id = session["user_id"]
+    to_email = session["email"]
     data = request.get_json(force=True)
     ticker = (data.get("ticker") or "").strip().upper()
     if not ticker:
@@ -454,39 +609,42 @@ def api_portfolio_add():
     conn = get_db()
     conn.execute(
         """
-        INSERT INTO tickers (ticker, qty, paid, custom_buy, custom_sell, active)
-        VALUES (?, ?, ?, ?, ?, 1)
-        ON CONFLICT(ticker) DO UPDATE SET
+        INSERT INTO tickers (user_id, ticker, qty, paid, custom_buy, custom_sell, active)
+        VALUES (?, ?, ?, ?, ?, ?, 1)
+        ON CONFLICT(user_id, ticker) DO UPDATE SET
             qty = excluded.qty,
             paid = excluded.paid,
             custom_buy = excluded.custom_buy,
             custom_sell = excluded.custom_sell,
             active = 1
         """,
-        (ticker, qty, paid, custom_buy, custom_sell),
+        (user_id, ticker, qty, paid, custom_buy, custom_sell),
     )
     conn.commit()
     conn.close()
 
-    result = analyze_and_store(ticker, custom_buy, custom_sell)
+    result = analyze_and_store(user_id, to_email, ticker, custom_buy, custom_sell)
     return jsonify(result)
 
 
 @app.route("/api/portfolio/<ticker>", methods=["DELETE"])
+@login_required
 def api_portfolio_remove(ticker):
+    user_id = session["user_id"]
     ticker = ticker.strip().upper()
     conn = get_db()
-    conn.execute("UPDATE tickers SET active = 0 WHERE ticker = ?", (ticker,))
+    conn.execute("UPDATE tickers SET active = 0 WHERE user_id = ? AND ticker = ?", (user_id, ticker))
     conn.commit()
     conn.close()
     with CACHE_LOCK:
-        LAST_ANALYSIS.pop(ticker, None)
+        LAST_ANALYSIS.pop((user_id, ticker), None)
     return jsonify({"ok": True})
 
 
 @app.route("/api/portfolio/refresh", methods=["POST"])
+@login_required
 def api_portfolio_refresh():
-    refresh_all_portfolio()
+    refresh_user_portfolio(session["user_id"])
     return jsonify({"ok": True})
 
 
@@ -494,10 +652,14 @@ def api_portfolio_refresh():
 # API - Scanner
 # --------------------------------------------------------------------------
 @app.route("/api/scan/<ticker>", methods=["GET"])
+@login_required
 def api_scan(ticker):
+    user_id = session["user_id"]
     ticker = ticker.strip().upper()
     conn = get_db()
-    row = conn.execute("SELECT * FROM tickers WHERE ticker = ? AND active = 1", (ticker,)).fetchone()
+    row = conn.execute(
+        "SELECT * FROM tickers WHERE user_id = ? AND ticker = ? AND active = 1", (user_id, ticker)
+    ).fetchone()
     conn.close()
 
     custom_buy = row["custom_buy"] if row else None
@@ -510,14 +672,18 @@ def api_scan(ticker):
 # API - Alert
 # --------------------------------------------------------------------------
 @app.route("/api/alerts", methods=["GET"])
+@login_required
 def api_alerts_list():
     conn = get_db()
-    rows = conn.execute("SELECT * FROM alerts ORDER BY created DESC").fetchall()
+    rows = conn.execute(
+        "SELECT * FROM alerts WHERE user_id = ? ORDER BY created DESC", (session["user_id"],)
+    ).fetchall()
     conn.close()
     return jsonify([dict(r) for r in rows])
 
 
 @app.route("/api/alerts", methods=["POST"])
+@login_required
 def api_alerts_add():
     data = request.get_json(force=True)
     ticker = (data.get("ticker") or "").strip().upper()
@@ -529,8 +695,8 @@ def api_alerts_add():
 
     conn = get_db()
     conn.execute(
-        "INSERT INTO alerts (ticker, condition, price, triggered) VALUES (?, ?, ?, 0)",
-        (ticker, condition, float(price)),
+        "INSERT INTO alerts (user_id, ticker, condition, price, triggered) VALUES (?, ?, ?, ?, 0)",
+        (session["user_id"], ticker, condition, float(price)),
     )
     conn.commit()
     conn.close()
@@ -538,9 +704,10 @@ def api_alerts_add():
 
 
 @app.route("/api/alerts/<int:alert_id>", methods=["DELETE"])
+@login_required
 def api_alerts_remove(alert_id):
     conn = get_db()
-    conn.execute("DELETE FROM alerts WHERE id = ?", (alert_id,))
+    conn.execute("DELETE FROM alerts WHERE id = ? AND user_id = ?", (alert_id, session["user_id"]))
     conn.commit()
     conn.close()
     return jsonify({"ok": True})
@@ -550,10 +717,12 @@ def api_alerts_remove(alert_id):
 # API - Storico
 # --------------------------------------------------------------------------
 @app.route("/api/history", methods=["GET"])
+@login_required
 def api_history():
     conn = get_db()
     rows = conn.execute(
-        "SELECT * FROM signals ORDER BY timestamp DESC LIMIT 200"
+        "SELECT * FROM signals WHERE user_id = ? ORDER BY timestamp DESC LIMIT 200",
+        (session["user_id"],),
     ).fetchall()
     conn.close()
 
@@ -586,8 +755,56 @@ def api_history():
 # --------------------------------------------------------------------------
 @app.route("/")
 def index():
-    return render_template_string(INDEX_HTML)
+    if "user_id" not in session:
+        return render_template_string(LOGIN_HTML)
+    return render_template_string(INDEX_HTML, user_email=session.get("email"), user_name=session.get("name"))
 
+
+LOGIN_HTML = r"""
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>Cecchino Pro</title>
+<style>
+body {
+  margin: 0;
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #0a0e14;
+  color: #e8eef5;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+.box { max-width: 360px; text-align: center; padding: 24px; }
+h1 { font-size: 24px; margin-bottom: 8px; }
+p { color: #8a97a8; font-size: 14px; line-height: 1.5; }
+a.google-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 24px;
+  background: #3b82f6;
+  color: white;
+  padding: 12px 22px;
+  border-radius: 8px;
+  text-decoration: none;
+  font-weight: 600;
+  font-size: 15px;
+}
+</style>
+</head>
+<body>
+  <div class="box">
+    <h1>🎯 Cecchino Pro</h1>
+    <p>Accedi con il tuo account Google per gestire il portafoglio e ricevere via mail gli alert BUY/SELL sui tuoi titoli.</p>
+    <a class="google-btn" href="/login">Accedi con Google</a>
+  </div>
+</body>
+</html>
+"""
 
 INDEX_HTML = r"""
 <!DOCTYPE html>
@@ -621,7 +838,10 @@ body {
   margin: 0 auto;
   padding: 14px 14px 84px 14px;
 }
-h1 { font-size: 20px; margin: 6px 0 16px 0; }
+.topbar { display: flex; justify-content: space-between; align-items: center; margin: 6px 0 16px 0; }
+h1 { font-size: 20px; margin: 0; }
+.user-info { font-size: 12px; color: var(--dim); text-align: right; }
+.user-info a { color: var(--dim); }
 .tab-view { display: none; }
 .tab-view.active { display: block; }
 
@@ -721,7 +941,10 @@ nav.bottom button.active { color: var(--blue); }
 </head>
 <body>
 <div id="app">
-  <h1>🎯 Cecchino Pro</h1>
+  <div class="topbar">
+    <h1>🎯 Cecchino Pro</h1>
+    <div class="user-info">{{ user_name }}<br>{{ user_email }} · <a href="/logout">Esci</a></div>
+  </div>
 
   <!-- SCANNER -->
   <div class="tab-view active" id="tab-scanner">
@@ -823,11 +1046,20 @@ function renderAnalysisCard(a, extraButtons) {
     </div>`;
 }
 
+async function apiFetch(url, options) {
+  const res = await fetch(url, options);
+  if (res.status === 401) {
+    window.location.reload();
+    throw new Error('Non autenticato');
+  }
+  return res;
+}
+
 async function scanTicker() {
   const ticker = document.getElementById('scan-input').value.trim().toUpperCase();
   if (!ticker) return;
   document.getElementById('scan-result').innerHTML = '<div class="spinner">Analisi in corso…</div>';
-  const res = await fetch(`/api/scan/${ticker}`);
+  const res = await apiFetch(`/api/scan/${ticker}`);
   const a = await res.json();
   const btn = a.error ? '' : `<button style="margin-top:10px" onclick="quickAdd('${a.ticker}', ${a.price})">+ Aggiungi al portafoglio</button>`;
   document.getElementById('scan-result').innerHTML = renderAnalysisCard(a, btn);
@@ -846,7 +1078,7 @@ function toggleAddForm(forceOpen) {
 
 async function loadPortfolio() {
   document.getElementById('portfolio-list').innerHTML = '<div class="spinner">Caricamento…</div>';
-  const res = await fetch('/api/portfolio');
+  const res = await apiFetch('/api/portfolio');
   const items = await res.json();
   renderPortfolioList(items);
 }
@@ -878,7 +1110,7 @@ async function addToPortfolio() {
     custom_sell: document.getElementById('pf-sell').value,
   };
   if (!body.ticker) return;
-  await fetch('/api/portfolio', {
+  await apiFetch('/api/portfolio', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify(body),
@@ -889,19 +1121,19 @@ async function addToPortfolio() {
 }
 
 async function removeFromPortfolio(ticker) {
-  await fetch(`/api/portfolio/${ticker}`, { method: 'DELETE' });
+  await apiFetch(`/api/portfolio/${ticker}`, { method: 'DELETE' });
   loadPortfolio();
 }
 
 async function refreshPortfolio() {
   document.getElementById('portfolio-list').innerHTML = '<div class="spinner">Aggiornamento in corso…</div>';
-  await fetch('/api/portfolio/refresh', { method: 'POST' });
+  await apiFetch('/api/portfolio/refresh', { method: 'POST' });
   loadPortfolio();
 }
 
 async function loadAlerts() {
   document.getElementById('alerts-list').innerHTML = '<div class="spinner">Caricamento…</div>';
-  const res = await fetch('/api/alerts');
+  const res = await apiFetch('/api/alerts');
   const alerts = await res.json();
   if (alerts.length === 0) {
     document.getElementById('alerts-list').innerHTML = '<div class="dim">Nessun alert configurato.</div>';
@@ -927,7 +1159,7 @@ async function addAlert() {
     price: document.getElementById('al-price').value,
   };
   if (!body.ticker || !body.price) return;
-  await fetch('/api/alerts', {
+  await apiFetch('/api/alerts', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify(body),
@@ -938,13 +1170,13 @@ async function addAlert() {
 }
 
 async function removeAlert(id) {
-  await fetch(`/api/alerts/${id}`, { method: 'DELETE' });
+  await apiFetch(`/api/alerts/${id}`, { method: 'DELETE' });
   loadAlerts();
 }
 
 async function loadHistory() {
   document.getElementById('history-list').innerHTML = '<div class="spinner">Caricamento…</div>';
-  const res = await fetch('/api/history');
+  const res = await apiFetch('/api/history');
   const data = await res.json();
   document.getElementById('history-stats').innerHTML = `
     <div class="row"><span>Cambi totali</span><b>${data.stats.total_changes}</b></div>
@@ -972,8 +1204,11 @@ async function loadHistory() {
 """
 
 
+# Inizializza il DB e il thread di riserva ad ogni import del modulo, cosi
+# funziona sia con "python app.py" sia con un application server come
+# gunicorn (che importa "app" senza eseguire il blocco __main__).
+init_db()
+start_background_monitor()
+
 if __name__ == "__main__":
-    init_db()
-    t = threading.Thread(target=monitor_loop, daemon=True)
-    t.start()
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))

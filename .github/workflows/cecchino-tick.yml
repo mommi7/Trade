@@ -1,0 +1,32 @@
+name: Cecchino Pro - tick orario
+
+# Fa girare gratuitamente il controllo dei segnali ogni ora chiamando
+# /api/cron/tick sull'app deployata (es. su Render), anche se il servizio
+# gratuito è andato in sleep per inattività (la chiamata lo risveglia).
+#
+# Richiede due secrets nel repo GitHub (Settings > Secrets and variables >
+# Actions):
+#   CECCHINO_URL          es. https://cecchino-pro.onrender.com
+#   CECCHINO_CRON_SECRET  stesso valore della variabile d'ambiente
+#                         CECCHINO_CRON_SECRET impostata su Render
+
+on:
+  schedule:
+    - cron: "0 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Chiama /api/cron/tick
+        run: |
+          curl -sS -X POST "${CECCHINO_URL}/api/cron/tick" \
+            -H "X-Cron-Secret: ${CECCHINO_CRON_SECRET}" \
+            --max-time 60 \
+            --retry 3 \
+            --retry-delay 5 \
+            --fail
+        env:
+          CECCHINO_URL: ${{ secrets.CECCHINO_URL }}
+          CECCHINO_CRON_SECRET: ${{ secrets.CECCHINO_CRON_SECRET }}
