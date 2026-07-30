@@ -893,11 +893,11 @@ def send_mail(subject, body):
         print(f"Errore invio mail: {e}")
 
 
-def send_telegram(text):
+def send_telegram(text, chat_id=None):
     """Manda un messaggio sul bot Telegram configurato. Molto più semplice
     della mail: nessuna password per le app, consegna istantanea, niente
     filtro spam. Facoltativo: se non configurato, non fa nulla."""
-    chat_id = get_telegram_chat_id()
+    chat_id = chat_id or get_telegram_chat_id()
     if not config.TELEGRAM_BOT_TOKEN or not chat_id:
         return
     try:
@@ -1292,16 +1292,173 @@ def monitor_loop():
         time.sleep(3600)
 
 
+# --------------------------------------------------------------------------
+# Bot Telegram interattivo (opzionale): manda una foto o un comando nella
+# chat e ricevi la risposta lì, senza mai aprire il sito. Usa long polling
+# su getUpdates (nessun webhook da registrare, funziona anche in locale/Pi).
+# --------------------------------------------------------------------------
+TELEGRAM_HELP_TEXT = (
+    "🎯 Cecchino Pro\n\n"
+    "Mandami una foto del tuo portafoglio (screenshot del broker) e la "
+    "importo, poi ti do subito il verdetto.\n\n"
+    "Comandi:\n"
+    "/portafoglio — riepilogo posizioni attuali\n"
+    "/verdetto — rigenera il verdetto AI su tutto il portafoglio\n"
+    "/aiuto — questo messaggio"
+)
+
+
+def _telegram_get_file_bytes(file_id):
+    try:
+        url = f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/getFile"
+        r = requests.get(url, params={"file_id": file_id}, timeout=15)
+        j = r.json()
+        if not j.get("ok"):
+            return None
+        file_path = j["result"]["file_path"]
+        file_url = f"https://api.telegram.org/file/bot{config.TELEGRAM_BOT_TOKEN}/{file_path}"
+        r2 = requests.get(file_url, timeout=20)
+        return r2.content if r2.status_code == 200 else None
+    except Exception as e:
+        print(f"Errore download foto Telegram: {e}")
+        return None
+
+
+def _format_portfolio_summary():
+    conn = get_db()
+    try:
+        rows = conn.execute("SELECT * FROM tickers WHERE active = 1 ORDER BY ticker").fetchall()
+    finally:
+        conn.close()
+    if not rows:
+        return "Portafoglio vuoto."
+    lines = []
+    for row in rows:
+        with CACHE_LOCK:
+            cached = LAST_ANALYSIS.get(row["ticker"])
+        if not cached or "error" in cached:
+            lines.append(f"{row['ticker']}: dati non disponibili")
+            continue
+        pnl_txt = ""
+        if row["qty"] and row["paid"]:
+            value = cached["price"] * row["qty"]
+            pnl_pct = (value - row["paid"]) / row["paid"] * 100
+            pnl_txt = f", P&L {pnl_pct:+.1f}%"
+        lines.append(f"{row['ticker']}: {cached['signal']} · {cached['price']} {cached['currency']}{pnl_txt}")
+    return "\n".join(lines)
+
+
+def _handle_telegram_message(message):
+    """Un solo proprietario per bot: la prima chat che scrive si registra da
+    sola (nessuno conosce lo username del bot appena creato tranne te);
+    qualsiasi altra chat viene ignorata in silenzio da quel momento in poi."""
+    chat_id = str(message.get("chat", {}).get("id", ""))
+    if not chat_id:
+        return
+
+    saved_chat_id = get_telegram_chat_id()
+    if not saved_chat_id:
+        set_telegram_chat_id(chat_id)
+        send_telegram(
+            "✅ Configurato! Da ora questo bot risponde solo a te.\n\n" + TELEGRAM_HELP_TEXT,
+            chat_id=chat_id,
+        )
+        return
+    if chat_id != saved_chat_id:
+        return  # bot personale: ignora chat diverse dal proprietario
+
+    text = (message.get("text") or "").strip()
+    photos = message.get("photo")
+
+    if photos:
+        send_telegram("📷 Foto ricevuta, la leggo (qualche secondo)…", chat_id=chat_id)
+        file_id = photos[-1]["file_id"]  # l'ultima è la risoluzione più alta
+        image_bytes = _telegram_get_file_bytes(file_id)
+        if not image_bytes:
+            send_telegram("Non sono riuscito a scaricare la foto, riprova.", chat_id=chat_id)
+            return
+        result = import_photo_positions(image_bytes, "image/jpeg")
+        if "error" in result:
+            send_telegram(f"❌ {result['error']}", chat_id=chat_id)
+            return
+        imported = result.get("imported", [])
+        skipped = result.get("skipped", [])
+        summary = f"✅ Importate {len(imported)} posizioni"
+        if skipped:
+            summary += f" ({len(skipped)} non riconosciute, controllale sul sito)"
+        send_telegram(summary, chat_id=chat_id)
+
+        verdict = generate_daily_verdict(send=False)
+        if "text" in verdict:
+            send_telegram("📋 Verdetto aggiornato:\n\n" + verdict["text"], chat_id=chat_id)
+        elif "error" in verdict:
+            send_telegram(f"(Verdetto non disponibile: {verdict['error']})", chat_id=chat_id)
+        return
+
+    if text.startswith("/verdetto"):
+        send_telegram("🤖 Genero il verdetto…", chat_id=chat_id)
+        verdict = generate_daily_verdict(send=False)
+        send_telegram(verdict.get("text") or f"Errore: {verdict.get('error')}", chat_id=chat_id)
+        return
+
+    if text.startswith("/portafoglio"):
+        send_telegram(_format_portfolio_summary(), chat_id=chat_id)
+        return
+
+    if text.startswith(("/start", "/aiuto", "/help")):
+        send_telegram(TELEGRAM_HELP_TEXT, chat_id=chat_id)
+        return
+
+    send_telegram("Non ho capito questo comando.\n\n" + TELEGRAM_HELP_TEXT, chat_id=chat_id)
+
+
+_telegram_update_offset = 0
+_telegram_started = False
+
+
+def telegram_poll_loop():
+    """Long polling: gira finché TELEGRAM_BOT_TOKEN è configurato. Nessun
+    webhook da registrare, funziona ovunque (anche dietro NAT/in locale)."""
+    global _telegram_update_offset
+    time.sleep(5)
+    while True:
+        try:
+            url = f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/getUpdates"
+            params = {"timeout": 25, "offset": _telegram_update_offset + 1}
+            r = requests.get(url, params=params, timeout=35)
+            j = r.json()
+            if not j.get("ok"):
+                time.sleep(10)
+                continue
+            for update in j.get("result", []):
+                _telegram_update_offset = max(_telegram_update_offset, update["update_id"])
+                message = update.get("message") or update.get("channel_post")
+                if message:
+                    try:
+                        _handle_telegram_message(message)
+                    except Exception as e:
+                        print(f"Errore gestione messaggio Telegram: {e}")
+        except Exception as e:
+            print(f"Errore polling Telegram (riprova tra 15s): {e}")
+            time.sleep(15)
+
+
 _monitor_started = False
 
 
 def start_background_monitor():
-    global _monitor_started
+    global _monitor_started, _telegram_started
     with CACHE_LOCK:
         if _monitor_started:
             return
         _monitor_started = True
     threading.Thread(target=monitor_loop, daemon=True).start()
+
+    if config.TELEGRAM_BOT_TOKEN:
+        with CACHE_LOCK:
+            if not _telegram_started:
+                _telegram_started = True
+                threading.Thread(target=telegram_poll_loop, daemon=True).start()
 
 
 # --------------------------------------------------------------------------
@@ -1421,24 +1578,15 @@ def api_portfolio_refresh():
     return jsonify({"ok": True})
 
 
-@app.route("/api/portfolio/import-photo", methods=["POST"])
-def api_portfolio_import_photo():
-    """Legge una foto del portafoglio (es. screenshot Trade Republic) con
-    Gemini Vision e aggiunge/aggiorna le posizioni trovate. La app non
-    conosce il numero esatto di azioni dalla foto: lo calcola dividendo il
-    valore di posizione (in €) per il prezzo di mercato attuale convertito
-    in €, un'approssimazione ragionevole dichiarata esplicitamente."""
-    if "image" not in request.files:
-        return jsonify({"error": "Nessuna immagine ricevuta"}), 400
-    file = request.files["image"]
-    image_bytes = file.read()
-    if not image_bytes:
-        return jsonify({"error": "Immagine vuota"}), 400
-    mime_type = file.mimetype or "image/jpeg"
-
+def import_photo_positions(image_bytes, mime_type):
+    """Nucleo condiviso dell'import da foto: usato sia dall'endpoint HTTP
+    /api/portfolio/import-photo sia dal bot Telegram (manda una foto in
+    chat = stesso risultato, senza aprire il sito). La app non conosce il
+    numero esatto di azioni dalla foto: lo stima dividendo il valore di
+    posizione (in €) per il prezzo di mercato attuale convertito in €."""
     extracted = extract_portfolio_from_image(image_bytes, mime_type)
     if "error" in extracted:
-        return jsonify(extracted), 400
+        return extracted
 
     imported, skipped = [], []
     conn = get_db()
@@ -1493,7 +1641,25 @@ def api_portfolio_import_photo():
         except Exception as e:
             print(f"Errore analisi post-import {item['ticker']}: {e}")
 
-    return jsonify({"imported": imported, "skipped": skipped})
+    return {"imported": imported, "skipped": skipped}
+
+
+@app.route("/api/portfolio/import-photo", methods=["POST"])
+def api_portfolio_import_photo():
+    """Legge una foto del portafoglio (es. screenshot Trade Republic) con
+    Gemini Vision e aggiunge/aggiorna le posizioni trovate."""
+    if "image" not in request.files:
+        return jsonify({"error": "Nessuna immagine ricevuta"}), 400
+    file = request.files["image"]
+    image_bytes = file.read()
+    if not image_bytes:
+        return jsonify({"error": "Immagine vuota"}), 400
+    mime_type = file.mimetype or "image/jpeg"
+
+    result = import_photo_positions(image_bytes, mime_type)
+    if "error" in result:
+        return jsonify(result), 400
+    return jsonify(result)
 
 
 # --------------------------------------------------------------------------

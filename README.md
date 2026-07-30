@@ -22,26 +22,47 @@ passaggi attiva). Questo è l'account che **invia** le mail — il
 avvio (si può cambiare in qualsiasi momento dalle Impostazioni ⚙️ in alto
 a destra).
 
-## 1b. Telegram al posto (o oltre) alla mail — più semplice e veloce
+## 1b. Bot Telegram — notifiche push E comandi interattivi
 
-Niente password per le app, niente filtro spam, consegna istantanea sul
-telefono. Due passaggi, **una volta sola per sempre** (il bot lo crei tu,
-poi lo riusi):
+Il sito resta il "cervello" che gira in background (calcola i segnali,
+tiene lo stop loss, aggiorna il portafoglio ogni ora): il bot Telegram è
+un secondo modo di parlargli, più comodo della mail e senza dover aprire
+il sito ogni volta.
+
+**Cosa puoi fare dalla chat Telegram, senza mai toccare il sito:**
+- **Mandare una foto** del portafoglio (screenshot del broker) → il bot la
+  legge, importa le posizioni e ti risponde subito con il verdetto AI.
+- `/portafoglio` → riepilogo posizioni attuali con segnale e P&L.
+- `/verdetto` → rigenera al volo il verdetto AI su tutto il portafoglio.
+- `/aiuto` → elenco comandi.
+- E ricevi comunque, in automatico, gli alert push (cambio segnale, stop
+  loss, opportunità, verdetto giornaliero) — quelli arrivano da soli,
+  senza che tu scriva nulla.
+
+**Configurazione, tutta dentro Telegram tranne un passaggio:**
 
 1. **Crea il bot** (2 minuti): apri Telegram, cerca **@BotFather**,
    mandagli `/newbot`, dagli un nome e uno username che finisca in `bot`
    (es. `CecchinoProBot`). Ti risponde con un **token** tipo
    `123456789:AAExxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx` — copialo.
-2. **Configuralo sull'app**: metti quel token nella variabile d'ambiente
-   `TELEGRAM_BOT_TOKEN` (Render → Environment, oppure `.env` in locale —
-   nome esatto, maiuscolo). Poi apri l'app → ⚙️ Impostazioni → scrivi
-   prima un messaggio qualsiasi al tuo bot su Telegram (cercalo per lo
-   username che gli hai dato) → torna sull'app → premi **"📡 Rileva
-   automaticamente"** → Salva. Fatto, l'app trova da sola il tuo chat ID,
-   non devi cercarlo a mano da nessuna parte.
+2. **Unico passaggio fuori da Telegram**: metti quel token nella variabile
+   d'ambiente `TELEGRAM_BOT_TOKEN` (Render → Environment, oppure `.env` in
+   locale — nome esatto, tutto maiuscolo) e aspetta il redeploy.
+3. **Da qui in poi, solo Telegram**: cerca il tuo bot per lo username che
+   gli hai dato e mandagli un messaggio qualsiasi (es. "ciao"). Il primo
+   messaggio che riceve si registra da solo come proprietario — nessun
+   altro può usarlo dopo, il bot ignora silenziosamente chiunque non sia
+   te. Ti risponde "✅ Configurato!" e da lì puoi mandare foto o comandi.
 
-Puoi usare mail e Telegram insieme: ogni alert va su entrambi i canali
-configurati.
+Puoi usare mail e Telegram insieme: ogni alert automatico va su entrambi
+i canali configurati.
+
+**Un limite onesto sulla reattività**: sull'hosting cloud gratuito
+(Render) il bot risponde ai tuoi messaggi solo mentre il processo è
+sveglio — il workflow GitHub Actions incluso lo risveglia ogni 10 minuti
+(vedi sotto), quindi nella pratica è quasi sempre reattivo ma non è un
+always-on garantito al 100%. Se vuoi zero compromessi, il Raspberry Pi
+(Opzione A) tiene il bot sempre sveglio per davvero.
 
 ## 2. Opzione A — Raspberry Pi (always-on reale, gratis)
 
@@ -115,17 +136,20 @@ GitHub e fa auto-deploy ad ogni push. Non serve carta di credito.
 5. Render fa un redeploy automatico dopo il cambio env vars. Apri l'URL:
    dovresti vedere la richiesta della tua email.
 
-### 3b. Tenerlo sveglio e far girare il tick orario gratis, con GitHub Actions
+### 3b. Tenerlo sveglio (e reattivo su Telegram) gratis, con GitHub Actions
 
 Il piano gratuito Render mette il servizio in **sleep dopo ~15 minuti di
 inattività** (si risveglia alla richiesta successiva, con qualche secondo di
-attesa). Per far comunque scattare il controllo dei segnali ogni ora è
-incluso un workflow GitHub Actions che chiama un endpoint dedicato e
-risveglia l'app da solo:
+attesa). Per far comunque scattare il controllo dei segnali *e* mantenere
+il bot Telegram reattivo è incluso un workflow GitHub Actions che chiama
+un endpoint dedicato e risveglia l'app da solo:
 
-`.github/workflows/cecchino-tick.yml` gira ogni ora (`cron: "0 * * * *"`,
-gratuito e illimitato sui repo pubblici GitHub) e chiama
-`POST /api/cron/tick` sull'app.
+`.github/workflows/cecchino-tick.yml` gira **ogni 10 minuti**
+(`cron: "*/10 * * * *"`, gratuito e illimitato sui repo pubblici GitHub) e
+chiama `POST /api/cron/tick` sull'app — tenerlo più frequente di prima
+(era ogni ora) serve soprattutto a far rispondere il bot Telegram quasi
+sempre, dato che il thread che lo ascolta gira solo mentre il processo è
+sveglio.
 
 Configuralo così:
 
@@ -134,7 +158,7 @@ Configuralo così:
    - `CECCHINO_URL` → es. `https://cecchino-pro.onrender.com`
    - `CECCHINO_CRON_SECRET` → lo stesso valore che Render ha generato per
      `CECCHINO_CRON_SECRET` (Render → Environment, copialo da lì)
-2. Il workflow parte da solo ogni ora. Puoi anche lanciarlo a mano da
+2. Il workflow parte da solo ogni 10 minuti. Puoi anche lanciarlo a mano da
    **Actions** → **Cecchino Pro - tick orario** → **Run workflow**.
 
 ### Limiti del free tier (leggi prima di fidarti)
@@ -281,10 +305,19 @@ condiviso).
   Gemini, opzionali) sono puramente aggiuntivi: se `GEMINI_API_KEY` non è
   impostata non fanno nessuna chiamata di rete e l'app si comporta
   esattamente come senza queste funzioni.
-- Telegram (`TELEGRAM_BOT_TOKEN` + chat ID dalle Impostazioni) è un canale
-  di notifica aggiuntivo, non sostitutivo: `broadcast()` manda su mail e
-  Telegram insieme, ognuno dei due funziona anche da solo se l'altro non
-  è configurato.
+- Telegram (`TELEGRAM_BOT_TOKEN` + chat ID) è sia canale push (`broadcast()`
+  manda su mail e Telegram insieme, ognuno funziona anche da solo) sia bot
+  interattivo: un thread in background fa long polling su `getUpdates`
+  (nessun webhook da registrare — funziona anche in locale/Raspberry Pi
+  dietro NAT). Il primo chat che scrive al bot si registra da sola come
+  proprietaria (`telegram_chat_id` nelle impostazioni); qualsiasi chat
+  diversa da quella viene ignorata in silenzio — un bot personale non deve
+  rispondere a sconosciuti che ne scoprono lo username.
+- Perché Gemini e non un'altra AI: è l'unica con un piano gratuito reale
+  (nessuna carta di credito). Claude/OpenAI danno risposte probabilmente
+  di qualità simile o superiore ma sono a consumo fin dal primo token —
+  se in futuro vuoi cambiarlo, il codice tocca solo `generate_ai_commentary`,
+  `extract_portfolio_from_image` e `generate_daily_verdict` in `app.py`.
 - L'import da foto stima la quantità di azioni come
   `valore_posizione_€ / prezzo_di_mercato_attuale_in_€` (con conversione
   EUR/USD live via il ticker Yahoo `EURUSD=X`, cache di un'ora): è una

@@ -1,8 +1,17 @@
-name: Cecchino Pro - tick orario
+name: Cecchino Pro - tick
 
-# Fa girare gratuitamente il controllo dei segnali ogni ora chiamando
-# /api/cron/tick sull'app deployata (es. su Render), anche se il servizio
-# gratuito è andato in sleep per inattività (la chiamata lo risveglia).
+# Fa girare gratuitamente il controllo dei segnali chiamando /api/cron/tick
+# sull'app deployata (es. su Render), anche se il servizio gratuito è
+# andato in sleep per inattività (la chiamata lo risveglia).
+#
+# Ogni 10 minuti invece che ogni ora: su Render free il processo va in
+# sleep dopo ~15 minuti senza richieste HTTP, e il bot Telegram (che gira
+# in un thread di background nello stesso processo) risponde solo mentre
+# il processo è sveglio. Un ping ogni 10 minuti lo mantiene sveglio quasi
+# sempre, quindi il bot risulta reattivo quasi come se fosse sempre acceso
+# (non è garantito al 100%: GitHub può ritardare l'esecuzione di qualche
+# minuto sotto carico, e per un always-on vero senza compromessi resta
+# il Raspberry Pi, vedi README).
 #
 # Richiede due secrets nel repo GitHub (Settings > Secrets and variables >
 # Actions):
@@ -12,7 +21,7 @@ name: Cecchino Pro - tick orario
 
 on:
   schedule:
-    - cron: "0 * * * *"
+    - cron: "*/10 * * * *"
   workflow_dispatch: {}
 
 jobs:
