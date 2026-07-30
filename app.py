@@ -8,6 +8,7 @@ endpoint /api/cron/tick (per trigger esterni gratuiti come GitHub Actions)
 analizzano i titoli ogni ora e mandano una mail quando un segnale cambia o
 un alert scatta.
 """
+import base64
 import json
 import os
 import re
@@ -126,6 +127,9 @@ def init_db():
         "ALTER TABLE tickers ADD COLUMN stop_triggered INTEGER DEFAULT 0",
         "ALTER TABLE settings ADD COLUMN last_screener_sent TEXT",
         "ALTER TABLE settings ADD COLUMN last_screener_results TEXT",
+        "ALTER TABLE settings ADD COLUMN telegram_chat_id TEXT",
+        "ALTER TABLE settings ADD COLUMN last_verdict_sent TEXT",
+        "ALTER TABLE settings ADD COLUMN last_verdict_text TEXT",
     ]:
         try:
             conn.execute(ddl)
@@ -154,12 +158,34 @@ def set_alert_email(email):
     conn.close()
 
 
+def get_telegram_chat_id():
+    conn = get_db()
+    row = conn.execute("SELECT telegram_chat_id FROM settings WHERE id = 1").fetchone()
+    conn.close()
+    return row["telegram_chat_id"] if row else None
+
+
+def set_telegram_chat_id(chat_id):
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO settings (id, telegram_chat_id) VALUES (1, ?) "
+        "ON CONFLICT(id) DO UPDATE SET telegram_chat_id = excluded.telegram_chat_id",
+        (chat_id,),
+    )
+    conn.commit()
+    conn.close()
+
+
 # --------------------------------------------------------------------------
-# Impostazioni - indirizzo email per gli alert
+# Impostazioni - indirizzo email e chat Telegram per gli alert
 # --------------------------------------------------------------------------
 @app.route("/api/settings", methods=["GET"])
 def api_settings_get():
-    return jsonify({"email": get_alert_email()})
+    return jsonify({
+        "email": get_alert_email(),
+        "telegram_chat_id": get_telegram_chat_id(),
+        "telegram_bot_configured": bool(config.TELEGRAM_BOT_TOKEN),
+    })
 
 
 @app.route("/api/settings", methods=["POST"])
@@ -170,6 +196,42 @@ def api_settings_set():
         return jsonify({"error": "Email non valida"}), 400
     set_alert_email(email)
     return jsonify({"ok": True, "email": email})
+
+
+@app.route("/api/settings/telegram", methods=["POST"])
+def api_settings_telegram_set():
+    data = request.get_json(force=True)
+    chat_id = str(data.get("chat_id") or "").strip()
+    set_telegram_chat_id(chat_id or None)
+    return jsonify({"ok": True, "telegram_chat_id": chat_id or None})
+
+
+@app.route("/api/settings/telegram/detect", methods=["POST"])
+def api_settings_telegram_detect():
+    """Trova automaticamente il chat_id di chi ha scritto per ultimo al bot,
+    così l'utente non deve cercarlo a mano (basta mandare un messaggio al bot
+    prima di premere questo pulsante)."""
+    if not config.TELEGRAM_BOT_TOKEN:
+        return jsonify({"error": "Bot Telegram non configurato (manca TELEGRAM_BOT_TOKEN)"}), 400
+    try:
+        url = f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/getUpdates"
+        r = requests.get(url, timeout=10)
+        j = r.json()
+        if not j.get("ok"):
+            return jsonify({"error": f"Errore Telegram: {j.get('description', 'sconosciuto')}"}), 400
+        updates = j.get("result", [])
+        if not updates:
+            return jsonify({"error": "Nessun messaggio trovato: scrivi prima qualcosa al bot su Telegram, poi riprova"}), 404
+        last = updates[-1]
+        chat = (last.get("message") or last.get("channel_post") or {}).get("chat", {})
+        chat_id = chat.get("id")
+        name = chat.get("first_name") or chat.get("title") or ""
+        if not chat_id:
+            return jsonify({"error": "Chat non trovata nell'ultimo messaggio"}), 404
+        set_telegram_chat_id(str(chat_id))
+        return jsonify({"ok": True, "telegram_chat_id": str(chat_id), "name": name})
+    except Exception as e:
+        return jsonify({"error": f"Errore di rete: {e}"}), 500
 
 
 # --------------------------------------------------------------------------
@@ -359,6 +421,35 @@ def fetch_market_data(ticker):
 
 
 # --------------------------------------------------------------------------
+# Cambio EUR/USD (per convertire i prezzi di mercato, quasi sempre in USD,
+# nei valori in € mostrati da Trade Republic durante l'import da foto)
+# --------------------------------------------------------------------------
+_FX_CACHE = {"rate": None, "at": 0}
+_FX_TTL_SECONDS = 3600
+
+
+def get_eurusd_rate():
+    """Quanti USD per 1 EUR. Cache di un'ora, fallback 1.08 se irraggiungibile
+    (approssimazione dichiarata, meglio di bloccare l'import)."""
+    now = time.time()
+    if _FX_CACHE["rate"] and now - _FX_CACHE["at"] < _FX_TTL_SECONDS:
+        return _FX_CACHE["rate"]
+    data = fetch_yahoo("EURUSD=X")
+    rate = data["price"] if data else 1.08
+    _FX_CACHE["rate"] = rate
+    _FX_CACHE["at"] = now
+    return rate
+
+
+def to_eur(amount, currency):
+    if amount is None:
+        return None
+    if currency == "EUR":
+        return amount
+    return amount / get_eurusd_rate()
+
+
+# --------------------------------------------------------------------------
 # Commento AI opzionale (Google Gemini, free tier senza carta di credito)
 # --------------------------------------------------------------------------
 def generate_ai_commentary(ticker, result):
@@ -391,6 +482,61 @@ def generate_ai_commentary(ticker, result):
     except Exception as e:
         print(f"Gemini fallito per {ticker}: {e}")
         return None
+
+
+def extract_portfolio_from_image(image_bytes, mime_type):
+    """Manda una foto (es. screenshot Trade Republic) a Gemini Vision e torna
+    una lista di posizioni estratte: [{ticker, name, value_eur, pnl_eur}].
+    Richiede GEMINI_API_KEY. Non solleva mai eccezioni: torna [] se qualcosa
+    va storto, con il dettaglio stampato nei log per debug."""
+    if not config.GEMINI_API_KEY:
+        return {"error": "Commento AI non configurato: manca GEMINI_API_KEY"}
+    try:
+        prompt = (
+            "Questa immagine è uno screenshot di un'app di investimenti (es. Trade Republic) "
+            "che mostra un elenco di posizioni in portafoglio. Per ogni posizione visibile, "
+            "estrai: il ticker di borsa standard (es. AAPL, ASML, 8031.T per Mitsui Tokyo), "
+            "il nome dell'azienda, il valore attuale della posizione in euro, e il "
+            "guadagno/perdita mostrato (in euro se c'è il simbolo €, altrimenti in percentuale "
+            "preceduta dal segno %). Rispondi SOLO con un array JSON valido, senza testo attorno, "
+            "in questo formato esatto: "
+            '[{"ticker": "AAPL", "name": "Apple", "value_eur": 1234.56, '
+            '"pnl_eur": 12.30, "pnl_pct": null}]. '
+            "Usa pnl_eur se il valore mostrato ha il simbolo €, altrimenti usa pnl_pct e lascia "
+            "pnl_eur a null. Se non riesci a leggere un valore, usa null. Se non trovi nessuna "
+            "posizione, rispondi con []."
+        )
+        url = (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            f"gemini-2.0-flash:generateContent?key={config.GEMINI_API_KEY}"
+        )
+        image_b64 = base64.b64encode(image_bytes).decode("ascii")
+        payload = {
+            "contents": [{
+                "parts": [
+                    {"text": prompt},
+                    {"inline_data": {"mime_type": mime_type, "data": image_b64}},
+                ]
+            }]
+        }
+        r = requests.post(url, json=payload, timeout=30)
+        if r.status_code != 200:
+            print(f"Gemini Vision HTTP {r.status_code}: {r.text[:300]!r}")
+            return {"error": "L'AI non è riuscita a leggere l'immagine (errore di rete/quota)"}
+        j = r.json()
+        text = j["candidates"][0]["content"]["parts"][0]["text"].strip()
+        # Gemini a volte avvolge il JSON in ```json ... ``` nonostante il prompt: ripulisco.
+        text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
+        positions = json.loads(text)
+        if not isinstance(positions, list):
+            return {"error": "Risposta AI non nel formato atteso"}
+        return {"positions": positions}
+    except json.JSONDecodeError as e:
+        print(f"Gemini Vision: JSON non valido: {e}")
+        return {"error": "L'AI ha risposto in un formato non leggibile, riprova con una foto più nitida"}
+    except Exception as e:
+        print(f"Gemini Vision fallito: {e}")
+        return {"error": f"Errore durante la lettura della foto: {e}"}
 
 
 # --------------------------------------------------------------------------
@@ -498,6 +644,31 @@ BOTTLENECK_UNIVERSE = [
     "LRCX", "KLAC", "AMAT", "TXN", "QCOM", "INTC", "ARM", "MRVL", "NXPI",
     "STM", "ON", "TER", "ENTG", "IBM", "CSCO",
 ]
+
+# Mappa ticker -> settore approssimativo, usata solo per il controllo di
+# concentrazione nel verdetto giornaliero (vedi generate_daily_verdict).
+# Non esaustiva: un ticker non in elenco viene contato come "Altro".
+SECTOR_MAP = {
+    "NVDA": "Tech", "ORCL": "Tech", "MSFT": "Tech", "GOOGL": "Tech", "GOOG": "Tech",
+    "AMZN": "Tech", "META": "Tech", "AVGO": "Tech", "TSM": "Tech", "ASML": "Tech",
+    "MU": "Tech", "AMD": "Tech", "ADBE": "Tech", "CRM": "Tech", "NOW": "Tech",
+    "PANW": "Tech", "CRWD": "Tech", "SNPS": "Tech", "CDNS": "Tech", "LRCX": "Tech",
+    "KLAC": "Tech", "AMAT": "Tech", "TXN": "Tech", "QCOM": "Tech", "INTC": "Tech",
+    "ARM": "Tech", "MRVL": "Tech", "NXPI": "Tech", "STM": "Tech", "ON": "Tech",
+    "TER": "Tech", "ENTG": "Tech", "IBM": "Tech", "CSCO": "Tech", "AAPL": "Tech",
+    "SNDK": "Tech", "SMCI": "Tech", "SHOP": "Tech", "PYPL": "Tech", "SQ": "Tech",
+    "SNOW": "Tech", "PLTR": "Tech", "UBER": "Tech", "ABNB": "Tech",
+    "JNJ": "Difensivo/Healthcare", "PFE": "Difensivo/Healthcare", "UNH": "Difensivo/Healthcare",
+    "KO": "Difensivo/Consumer", "PEP": "Difensivo/Consumer", "PG": "Difensivo/Consumer",
+    "WMT": "Difensivo/Consumer", "COST": "Difensivo/Consumer", "MCD": "Difensivo/Consumer",
+    "T": "Difensivo/Telecom", "VZ": "Difensivo/Telecom",
+    "XOM": "Energia", "CVX": "Energia",
+    "JPM": "Finanziari", "BAC": "Finanziari", "GS": "Finanziari", "MS": "Finanziari",
+    "V": "Pagamenti", "MA": "Pagamenti", "AXP": "Pagamenti",
+    "BA": "Industriali", "CAT": "Industriali", "GE": "Industriali", "LMT": "Difesa",
+    "RTX": "Difesa", "BIP": "Infrastrutture", "8031": "Trading/Giappone",
+    "BTC-USD": "Crypto", "ETH-USD": "Crypto", "SOL-USD": "Crypto",
+}
 
 
 def search_local_tickers(query):
@@ -722,6 +893,27 @@ def send_mail(subject, body):
         print(f"Errore invio mail: {e}")
 
 
+def send_telegram(text):
+    """Manda un messaggio sul bot Telegram configurato. Molto più semplice
+    della mail: nessuna password per le app, consegna istantanea, niente
+    filtro spam. Facoltativo: se non configurato, non fa nulla."""
+    chat_id = get_telegram_chat_id()
+    if not config.TELEGRAM_BOT_TOKEN or not chat_id:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/sendMessage"
+        requests.post(url, json={"chat_id": chat_id, "text": text}, timeout=10)
+    except Exception as e:
+        print(f"Errore invio Telegram: {e}")
+
+
+def broadcast(subject, body):
+    """Manda su tutti i canali configurati (mail e/o Telegram). Se nessuno è
+    configurato non succede nulla, l'app continua a funzionare comunque."""
+    send_mail(subject, body)
+    send_telegram(f"{subject}\n\n{body}")
+
+
 def notify_signal_change(ticker, old_signal, new_result):
     subject = f"🎯 CECCHINO: {ticker} {old_signal} → {new_result['signal']}"
     reasons_txt = "\n".join(f"• {r}" for r in new_result["reasons"])
@@ -735,7 +927,7 @@ def notify_signal_change(ticker, old_signal, new_result):
         f"Motivazioni:\n{reasons_txt}\n\n"
         f"Apri Cecchino: {config.PUBLIC_URL}"
     )
-    send_mail(subject, body)
+    broadcast(subject, body)
 
 
 def notify_alert(ticker, condition, threshold, price):
@@ -747,7 +939,7 @@ def notify_alert(ticker, condition, threshold, price):
         f"Prezzo attuale: {price}\n\n"
         f"Apri Cecchino: {config.PUBLIC_URL}"
     )
-    send_mail(subject, body)
+    broadcast(subject, body)
 
 
 def notify_stop_raised(ticker, new_stop, high_water_mark):
@@ -761,7 +953,7 @@ def notify_stop_raised(ticker, new_stop, high_water_mark):
         "senza doverlo decidere ogni volta a mano.\n\n"
         f"Apri Cecchino: {config.PUBLIC_URL}"
     )
-    send_mail(subject, body)
+    broadcast(subject, body)
 
 
 def notify_stop_triggered(ticker, stop_level, price):
@@ -774,7 +966,7 @@ def notify_stop_triggered(ticker, stop_level, price):
         "limitare le perdite o proteggere il guadagno accumulato.\n\n"
         f"Apri Cecchino: {config.PUBLIC_URL}"
     )
-    send_mail(subject, body)
+    broadcast(subject, body)
 
 
 # --------------------------------------------------------------------------
@@ -921,7 +1113,7 @@ def notify_opportunities(results):
         + "\n\n".join(blocks)
         + f"\n\nApri Cecchino: {config.PUBLIC_URL}"
     )
-    send_mail(subject, body)
+    broadcast(subject, body)
 
 
 def run_market_screener(send_email=True):
@@ -975,6 +1167,115 @@ def run_market_screener(send_email=True):
     return top
 
 
+def generate_daily_verdict(send=True):
+    """Verdetto giornaliero AI (Gemini) sull'intero portafoglio: per ogni
+    posizione un giudizio COMPRA/AUMENTA/TIENI/RIDUCI/VENDI basato sui
+    segnali tecnici già calcolati (RSI, medie, 52 settimane, volumi, stop
+    loss, peso). Attenzione: Gemini qui NON fa ricerche web in tempo reale,
+    quindi non conosce notizie specifiche del giorno a meno che non siano
+    già riflesse nel prezzo — è un'analisi tecnica+AI, non una ricerca
+    fondamentale verificata."""
+    if not config.GEMINI_API_KEY:
+        return {"error": "Serve GEMINI_API_KEY per il verdetto giornaliero AI"}
+
+    conn = get_db()
+    try:
+        rows = conn.execute("SELECT * FROM tickers WHERE active = 1 ORDER BY ticker").fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        return {"error": "Portafoglio vuoto"}
+
+    positions = []
+    total_value = 0.0
+    for row in rows:
+        with CACHE_LOCK:
+            cached = LAST_ANALYSIS.get(row["ticker"])
+        if cached is None or "error" in cached:
+            continue
+        value = cached["price"] * row["qty"] if row["qty"] else cached["price"]
+        total_value += value
+        positions.append({"row": row, "analysis": cached, "value": value})
+
+    if not positions:
+        return {"error": "Nessuna posizione con dati validi in cache: apri il tab Portafoglio prima"}
+
+    sector_weights = {}
+    lines = []
+    for p in positions:
+        ticker = p["row"]["ticker"]
+        a = p["analysis"]
+        weight = (p["value"] / total_value * 100) if total_value else 0
+        sector = SECTOR_MAP.get(ticker, "Altro")
+        sector_weights[sector] = sector_weights.get(sector, 0) + weight
+        pnl_pct = None
+        if p["row"]["qty"] and p["row"]["paid"]:
+            pnl_pct = (p["value"] - p["row"]["paid"]) / p["row"]["paid"] * 100
+        stop_txt = f", stop loss {a['stop_loss']}" if a.get("stop_loss") is not None else ""
+        pnl_txt = f"{pnl_pct:.1f}%" if pnl_pct is not None else "non disponibile"
+        lines.append(
+            f"- {ticker}: segnale {a['signal']} (score {a['score']}), prezzo {a['price']} {a['currency']}, "
+            f"peso {weight:.1f}% del portafoglio, RSI {a['rsi']}, "
+            f"distanza da max 52W {a['dist_high52']}%, P&L {pnl_txt}{stop_txt}"
+        )
+
+    sector_lines = [f"- {s}: {w:.1f}%" for s, w in sector_weights.items()]
+
+    prompt = (
+        "Sei un analista di portafoglio diretto e senza fronzoli. Ti do la situazione attuale "
+        "di un portafoglio azionario con dati tecnici già calcolati (RSI, medie mobili, distanza "
+        "dai massimi/minimi a 52 settimane, punteggio del segnale, peso, P&L, stop loss). NON hai "
+        "accesso a notizie in tempo reale: basati solo sui numeri forniti e sulla tua conoscenza "
+        "generale delle aziende, e se non sei sicuro di qualcosa di specifico e recente dillo "
+        "esplicitamente invece di inventarlo. Per ogni posizione dai un verdetto tra: COMPRA, "
+        "AUMENTA, TIENI, RIDUCI, VENDI, con una riga di motivazione al massimo. Segnala se un "
+        "settore supera il 25% del portafoglio o un singolo titolo supera il 15%. Chiudi con una "
+        "riga finale con l'azione prioritaria della giornata (o \"nessuna operazione\" se è così). "
+        "Italiano diretto, zero ripetizioni, testo semplice pronto per Telegram (non JSON, non markdown pesante).\n\n"
+        "Posizioni:\n" + "\n".join(lines) + "\n\n"
+        "Pesi per settore:\n" + "\n".join(sector_lines)
+    )
+
+    try:
+        url = (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            f"gemini-2.0-flash:generateContent?key={config.GEMINI_API_KEY}"
+        )
+        r = requests.post(url, json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=30)
+        if r.status_code != 200:
+            print(f"Gemini verdetto HTTP {r.status_code}: {r.text[:300]!r}")
+            return {"error": "L'AI non ha risposto (errore di rete o quota esaurita)"}
+        j = r.json()
+        text = j["candidates"][0]["content"]["parts"][0]["text"].strip()
+    except Exception as e:
+        print(f"Gemini verdetto fallito: {e}")
+        return {"error": f"Errore: {e}"}
+
+    updated = datetime.now().isoformat(timespec="seconds")
+    conn = get_db()
+    try:
+        conn.execute(
+            "INSERT INTO settings (id, last_verdict_text) VALUES (1, ?) "
+            "ON CONFLICT(id) DO UPDATE SET last_verdict_text = excluded.last_verdict_text",
+            (text,),
+        )
+        conn.commit()
+
+        if send:
+            today = datetime.now().strftime("%Y-%m-%d")
+            row = conn.execute("SELECT last_verdict_sent FROM settings WHERE id = 1").fetchone()
+            already_sent = row and row["last_verdict_sent"] == today
+            if not already_sent:
+                broadcast("📋 CECCHINO: verdetto giornaliero del portafoglio", text)
+                conn.execute("UPDATE settings SET last_verdict_sent = ? WHERE id = 1", (today,))
+                conn.commit()
+    finally:
+        conn.close()
+
+    return {"text": text, "updated": updated}
+
+
 def monitor_loop():
     """Thread di riserva per esecuzioni locali/24-7 reali (es. Raspberry Pi).
     Su hosting cloud gratuito che va in sleep, usa /api/cron/tick invece."""
@@ -983,6 +1284,7 @@ def monitor_loop():
         try:
             refresh_all_portfolio()
             run_market_screener()
+            generate_daily_verdict()
         except Exception as e:
             print(f"Errore monitor (riprova in 5 min): {e}")
             time.sleep(300)
@@ -1012,7 +1314,27 @@ def api_cron_tick():
         return jsonify({"error": "unauthorized"}), 401
     refresh_all_portfolio()
     run_market_screener()
+    generate_daily_verdict()
     return jsonify({"ok": True})
+
+
+# --------------------------------------------------------------------------
+# API - Verdetto giornaliero AI (Gemini)
+# --------------------------------------------------------------------------
+@app.route("/api/verdict", methods=["GET"])
+def api_verdict_get():
+    conn = get_db()
+    row = conn.execute("SELECT last_verdict_text FROM settings WHERE id = 1").fetchone()
+    conn.close()
+    return jsonify({"text": row["last_verdict_text"] if row and row["last_verdict_text"] else None})
+
+
+@app.route("/api/verdict/refresh", methods=["POST"])
+def api_verdict_refresh():
+    result = generate_daily_verdict(send=False)
+    if "error" in result:
+        return jsonify(result), 400
+    return jsonify(result)
 
 
 # --------------------------------------------------------------------------
@@ -1097,6 +1419,81 @@ def api_portfolio_remove(ticker):
 def api_portfolio_refresh():
     refresh_all_portfolio()
     return jsonify({"ok": True})
+
+
+@app.route("/api/portfolio/import-photo", methods=["POST"])
+def api_portfolio_import_photo():
+    """Legge una foto del portafoglio (es. screenshot Trade Republic) con
+    Gemini Vision e aggiunge/aggiorna le posizioni trovate. La app non
+    conosce il numero esatto di azioni dalla foto: lo calcola dividendo il
+    valore di posizione (in €) per il prezzo di mercato attuale convertito
+    in €, un'approssimazione ragionevole dichiarata esplicitamente."""
+    if "image" not in request.files:
+        return jsonify({"error": "Nessuna immagine ricevuta"}), 400
+    file = request.files["image"]
+    image_bytes = file.read()
+    if not image_bytes:
+        return jsonify({"error": "Immagine vuota"}), 400
+    mime_type = file.mimetype or "image/jpeg"
+
+    extracted = extract_portfolio_from_image(image_bytes, mime_type)
+    if "error" in extracted:
+        return jsonify(extracted), 400
+
+    imported, skipped = [], []
+    conn = get_db()
+    try:
+        for pos in extracted["positions"]:
+            ticker = (pos.get("ticker") or "").strip().upper()
+            value_eur = pos.get("value_eur")
+            pnl_eur = pos.get("pnl_eur")
+            pnl_pct = pos.get("pnl_pct")
+
+            if not ticker or value_eur is None:
+                skipped.append({"raw": pos, "motivo": "ticker o valore non leggibile dalla foto"})
+                continue
+
+            data = fetch_market_data(ticker)
+            if not data:
+                skipped.append({"ticker": ticker, "motivo": "prezzo non trovato, aggiungilo a mano"})
+                continue
+
+            price_eur = to_eur(data["price"], data.get("currency", "USD"))
+            if not price_eur:
+                skipped.append({"ticker": ticker, "motivo": "impossibile convertire il prezzo in euro"})
+                continue
+
+            qty = round(value_eur / price_eur, 4)
+            if pnl_eur is not None:
+                paid = round(value_eur - pnl_eur, 2)
+            elif pnl_pct is not None:
+                paid = round(value_eur / (1 + pnl_pct / 100), 2)
+            else:
+                paid = round(value_eur, 2)  # nessun P&L leggibile: assume carico = valore attuale
+
+            conn.execute(
+                """
+                INSERT INTO tickers (ticker, qty, paid, active)
+                VALUES (?, ?, ?, 1)
+                ON CONFLICT(ticker) DO UPDATE SET
+                    qty = excluded.qty,
+                    paid = excluded.paid,
+                    active = 1
+                """,
+                (ticker, qty, paid),
+            )
+            imported.append({"ticker": ticker, "qty": qty, "paid": paid, "value_eur": value_eur})
+        conn.commit()
+    finally:
+        conn.close()
+
+    for item in imported:
+        try:
+            analyze_and_store(item["ticker"], None, None)
+        except Exception as e:
+            print(f"Errore analisi post-import {item['ticker']}: {e}")
+
+    return jsonify({"imported": imported, "skipped": skipped})
 
 
 # --------------------------------------------------------------------------
@@ -1409,6 +1806,39 @@ nav.bottom button.active { color: var(--blue); }
 #email-gate input { width: 100%; margin-top: 18px; text-align: center; }
 #email-gate button { width: 100%; margin-top: 10px; }
 #email-gate .err { color: var(--sell); font-size: 13px; margin-top: 8px; min-height: 16px; }
+
+#settings-modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 998;
+  padding: 20px;
+}
+#settings-modal .box {
+  max-width: 400px;
+  width: 100%;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 20px;
+}
+#settings-modal h2 { font-size: 18px; margin: 0 0 4px 0; }
+#settings-modal label { display: block; font-size: 12px; color: var(--dim); margin: 14px 0 6px 0; }
+#settings-modal input { width: 100%; }
+#settings-modal .hint { font-size: 12px; color: var(--dim); margin-top: 6px; line-height: 1.4; }
+#settings-modal .row-btns { display: flex; gap: 8px; margin-top: 8px; }
+#settings-modal .err { color: var(--sell); font-size: 13px; margin-top: 8px; min-height: 16px; }
+#settings-modal .ok { color: var(--buy); font-size: 13px; margin-top: 8px; min-height: 16px; }
+#settings-modal .close-x { float: right; cursor: pointer; color: var(--dim); font-size: 20px; line-height: 1; }
+
+.verdict-box {
+  white-space: pre-wrap;
+  font-size: 13px;
+  line-height: 1.5;
+}
 </style>
 </head>
 <body>
@@ -1423,10 +1853,37 @@ nav.bottom button.active { color: var(--blue); }
   </div>
 </div>
 
+<div id="settings-modal" style="display:none">
+  <div class="box">
+    <span class="close-x" onclick="closeSettings()">✕</span>
+    <h2>⚙️ Impostazioni</h2>
+    <div class="dim" style="font-size:12px">Canali per ricevere gli alert BUY/SELL</div>
+
+    <label>Email</label>
+    <input id="set-email" type="email" placeholder="tuamail@esempio.com">
+
+    <label>Telegram — chat ID</label>
+    <input id="set-telegram" type="text" placeholder="es. 123456789">
+    <div class="row-btns">
+      <button class="secondary" style="flex:1" onclick="detectTelegramChatId()">📡 Rileva automaticamente</button>
+    </div>
+    <div class="hint">Prima scrivi un messaggio qualsiasi al tuo bot su Telegram (es. "ciao"), poi premi "Rileva automaticamente" — trova da solo il tuo chat ID. Se il bot non è ancora configurato lato server, vedi il README per crearlo con @BotFather.</div>
+
+    <div class="row-btns">
+      <button style="flex:1" onclick="saveSettings()">Salva</button>
+    </div>
+    <div class="err" id="settings-err"></div>
+    <div class="ok" id="settings-ok"></div>
+  </div>
+</div>
+
 <div id="app">
   <div class="row">
     <h1>🎯 Cecchino Pro</h1>
-    <span class="dim" id="email-display" onclick="openEmailEdit()" style="cursor:pointer"></span>
+    <div class="row" style="gap:10px">
+      <span class="dim" id="email-display" onclick="openSettings()" style="cursor:pointer"></span>
+      <button class="secondary" onclick="openSettings()" style="padding:6px 10px">⚙️</button>
+    </div>
   </div>
 
   <!-- SCANNER -->
@@ -1445,9 +1902,11 @@ nav.bottom button.active { color: var(--blue); }
 
   <!-- PORTAFOGLIO -->
   <div class="tab-view" id="tab-portfolio">
-    <div class="row" style="margin-bottom:10px">
+    <div class="row" style="margin-bottom:10px; flex-wrap:wrap; gap:8px">
       <button class="secondary" onclick="refreshPortfolio()">🔄 Aggiorna prezzi</button>
+      <button class="secondary" onclick="triggerPhotoImport()">📷 Importa da foto</button>
       <button onclick="toggleAddForm()">+ Aggiungi</button>
+      <input type="file" id="photo-input" accept="image/*" capture="environment" style="display:none" onchange="importPhoto(this.files[0])">
     </div>
     <div class="card" id="add-form" style="display:none">
       <div class="form-grid">
@@ -1463,6 +1922,17 @@ nav.bottom button.active { color: var(--blue); }
         <button class="full" onclick="addToPortfolio()">Salva</button>
       </div>
     </div>
+    <div id="photo-import-result"></div>
+
+    <div class="card">
+      <div class="row">
+        <b style="font-size:14px">📋 Verdetto giornaliero AI</b>
+        <button class="secondary" onclick="refreshVerdict()" style="padding:6px 10px">🔄</button>
+      </div>
+      <div class="dim" style="font-size:11px;margin-top:4px">Basato sui segnali tecnici (RSI/medie/52 settimane/volumi), non su notizie in tempo reale — non sostituisce una verifica manuale prima di operare.</div>
+      <div class="verdict-box dim" id="verdict-text" style="margin-top:10px">Premi 🔄 per generarlo (richiede GEMINI_API_KEY configurata).</div>
+    </div>
+
     <div id="portfolio-list"></div>
   </div>
 
@@ -1545,21 +2015,110 @@ async function saveGateEmail() {
   refreshEmailUI();
 }
 
-function openEmailEdit() {
-  const next = prompt('Email per gli alert:', CURRENT_EMAIL || '');
-  if (next === null) return;
-  fetch('/api/settings', {
+async function openSettings() {
+  document.getElementById('settings-err').textContent = '';
+  document.getElementById('settings-ok').textContent = '';
+  document.getElementById('set-email').value = CURRENT_EMAIL || '';
+  try {
+    const res = await fetch('/api/settings');
+    const data = await res.json();
+    document.getElementById('set-telegram').value = data.telegram_chat_id || '';
+  } catch (e) { /* ignora, campo resta vuoto */ }
+  document.getElementById('settings-modal').style.display = 'flex';
+}
+
+function closeSettings() {
+  document.getElementById('settings-modal').style.display = 'none';
+}
+
+async function saveSettings() {
+  const errEl = document.getElementById('settings-err');
+  const okEl = document.getElementById('settings-ok');
+  errEl.textContent = '';
+  okEl.textContent = '';
+  const email = document.getElementById('set-email').value.trim();
+  const telegram = document.getElementById('set-telegram').value.trim();
+
+  const res = await fetch('/api/settings', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({email: next.trim()}),
-  }).then(res => res.json()).then(data => {
-    if (data.email) {
-      CURRENT_EMAIL = data.email;
-      refreshEmailUI();
-    } else if (data.error) {
-      alert(data.error);
-    }
+    body: JSON.stringify({email}),
   });
+  const data = await res.json();
+  if (!res.ok) { errEl.textContent = data.error || 'Errore'; return; }
+  CURRENT_EMAIL = data.email;
+
+  await fetch('/api/settings/telegram', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({chat_id: telegram}),
+  });
+
+  refreshEmailUI();
+  okEl.textContent = 'Salvato ✓';
+}
+
+async function detectTelegramChatId() {
+  const errEl = document.getElementById('settings-err');
+  const okEl = document.getElementById('settings-ok');
+  errEl.textContent = '';
+  okEl.textContent = '';
+  const res = await fetch('/api/settings/telegram/detect', { method: 'POST' });
+  const data = await res.json();
+  if (!res.ok) { errEl.textContent = data.error || 'Errore'; return; }
+  document.getElementById('set-telegram').value = data.telegram_chat_id;
+  okEl.textContent = `Trovato: ${data.name || data.telegram_chat_id} ✓ (premi Salva)`;
+}
+
+function triggerPhotoImport() {
+  document.getElementById('photo-input').click();
+}
+
+async function importPhoto(file) {
+  if (!file) return;
+  const resultEl = document.getElementById('photo-import-result');
+  resultEl.innerHTML = '<div class="card"><div class="spinner">📷 Lettura della foto in corso (può richiedere qualche secondo)…</div></div>';
+  const formData = new FormData();
+  formData.append('image', file);
+  try {
+    const res = await fetch('/api/portfolio/import-photo', { method: 'POST', body: formData });
+    const data = await res.json();
+    if (!res.ok) {
+      resultEl.innerHTML = `<div class="card"><span class="dim">${data.error || 'Errore durante la lettura della foto'}</span></div>`;
+      return;
+    }
+    const imported = data.imported || [];
+    const skipped = data.skipped || [];
+    let html = '';
+    if (imported.length) {
+      html += `<div class="card"><b>✅ Importate ${imported.length} posizioni:</b><div class="dim" style="margin-top:6px">` +
+        imported.map(i => `${i.ticker}: ${i.qty} unità, carico stimato €${i.paid}`).join('<br>') + '</div></div>';
+    }
+    if (skipped.length) {
+      html += `<div class="card"><b>⚠️ Non importate (${skipped.length}):</b><div class="dim" style="margin-top:6px">` +
+        skipped.map(s => `${s.ticker || '?'}: ${s.motivo}`).join('<br>') + '</div></div>';
+    }
+    resultEl.innerHTML = html || '<div class="card"><span class="dim">Nessuna posizione riconosciuta nella foto.</span></div>';
+    loadPortfolio();
+  } catch (e) {
+    resultEl.innerHTML = '<div class="card"><span class="dim">Errore di rete durante l\'invio della foto.</span></div>';
+  }
+  document.getElementById('photo-input').value = '';
+}
+
+async function loadVerdict() {
+  try {
+    const res = await fetch('/api/verdict');
+    const data = await res.json();
+    document.getElementById('verdict-text').textContent = data.text || 'Premi 🔄 per generarlo (richiede GEMINI_API_KEY configurata).';
+  } catch (e) { /* silenzioso, resta il testo di default */ }
+}
+
+async function refreshVerdict() {
+  document.getElementById('verdict-text').textContent = '🤖 Generazione in corso…';
+  const res = await fetch('/api/verdict/refresh', { method: 'POST' });
+  const data = await res.json();
+  document.getElementById('verdict-text').textContent = data.text || data.error || 'Errore';
 }
 
 refreshEmailUI();
@@ -1630,7 +2189,7 @@ function showTab(name) {
   document.querySelectorAll('nav.bottom button').forEach(el => el.classList.remove('active'));
   document.getElementById('tab-' + name).classList.add('active');
   document.getElementById('nav-' + name).classList.add('active');
-  if (name === 'portfolio') loadPortfolio();
+  if (name === 'portfolio') { loadPortfolio(); loadVerdict(); }
   if (name === 'alerts') loadAlerts();
   if (name === 'history') loadHistory();
   if (name === 'opportunities') loadOpportunities();

@@ -19,8 +19,29 @@ Genera una **password per le app** Gmail su
 `https://myaccount.google.com/apppasswords` (richiede la verifica in due
 passaggi attiva). Questo è l'account che **invia** le mail — il
 **destinatario** è l'email che inserisci direttamente nell'app al primo
-avvio (si può cambiare in qualsiasi momento cliccando sulla tua email in
-alto a destra).
+avvio (si può cambiare in qualsiasi momento dalle Impostazioni ⚙️ in alto
+a destra).
+
+## 1b. Telegram al posto (o oltre) alla mail — più semplice e veloce
+
+Niente password per le app, niente filtro spam, consegna istantanea sul
+telefono. Due passaggi, **una volta sola per sempre** (il bot lo crei tu,
+poi lo riusi):
+
+1. **Crea il bot** (2 minuti): apri Telegram, cerca **@BotFather**,
+   mandagli `/newbot`, dagli un nome e uno username che finisca in `bot`
+   (es. `CecchinoProBot`). Ti risponde con un **token** tipo
+   `123456789:AAExxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx` — copialo.
+2. **Configuralo sull'app**: metti quel token nella variabile d'ambiente
+   `TELEGRAM_BOT_TOKEN` (Render → Environment, oppure `.env` in locale —
+   nome esatto, maiuscolo). Poi apri l'app → ⚙️ Impostazioni → scrivi
+   prima un messaggio qualsiasi al tuo bot su Telegram (cercalo per lo
+   username che gli hai dato) → torna sull'app → premi **"📡 Rileva
+   automaticamente"** → Salva. Fatto, l'app trova da sola il tuo chat ID,
+   non devi cercarlo a mano da nessuna parte.
+
+Puoi usare mail e Telegram insieme: ogni alert va su entrambi i canali
+configurati.
 
 ## 2. Opzione A — Raspberry Pi (always-on reale, gratis)
 
@@ -133,9 +154,29 @@ Configuralo così:
 
 ## Funzionalità
 
-- **Email per gli alert**: alla prima apertura l'app chiede solo
-  l'indirizzo a cui mandare i segnali BUY/SELL. Si può cambiare in
-  qualsiasi momento toccando l'email in alto a destra.
+- **Email e/o Telegram per gli alert**: alla prima apertura l'app chiede
+  solo l'indirizzo a cui mandare i segnali BUY/SELL. Telegram si aggiunge
+  dalle Impostazioni ⚙️ in alto a destra (vedi sezione 1b) — più semplice
+  e istantaneo della mail, i due canali funzionano insieme se li
+  configuri entrambi.
+- **Importa portafoglio da foto 📷**: nel tab Portafoglio, "Importa da
+  foto" — scatta o carica uno screenshot del tuo broker (es. Trade
+  Republic) e Gemini Vision legge titolo, valore e guadagno/perdita di
+  ogni posizione, aggiungendola in automatico. La quantità di azioni non è
+  quasi mai leggibile dallo screenshot: viene **stimata** dividendo il
+  valore della posizione per il prezzo di mercato attuale (convertito in
+  €) — un'approssimazione dichiarata, non un dato letto pixel per pixel.
+  Controlla sempre il risultato dopo l'import. Richiede `GEMINI_API_KEY`.
+- **Verdetto giornaliero AI**: nel tab Portafoglio, una card genera (una
+  volta al giorno in automatico, o su richiesta col pulsante 🔄) un
+  giudizio COMPRA/AUMENTA/TIENI/RIDUCI/VENDI per ogni posizione, basato
+  sui segnali tecnici che l'app già calcola (RSI, medie, 52 settimane,
+  volumi, peso, concentrazione per settore). **Attenzione**: Gemini qui
+  non fa ricerche web in tempo reale — non sa di una notizia uscita ieri
+  sera a meno che non sia già riflessa nel prezzo. È un'analisi
+  tecnica+AI, comoda per un check-up quotidiano veloce, non sostituisce
+  una verifica manuale con dati e notizie verificati prima di operare
+  cifre importanti. Richiede `GEMINI_API_KEY`.
 - **Scanner**: analisi on-demand di qualsiasi ticker (prezzo, RSI 14, MA50,
   MA200, distanza da massimo/minimo 52 settimane, segnale e motivazioni in
   italiano).
@@ -236,9 +277,19 @@ condiviso).
   giorni) che conferma la direzione del prezzo del giorno rafforza o
   indebolisce lo score. Nella card di analisi vedi anche le "zone"
   acquisto/vendita 🤖, calcolate automaticamente dal range a 52 settimane.
-- Il commento AI (Google Gemini, opzionale) è puramente aggiuntivo: se
-  `GEMINI_API_KEY` non è impostata non fa nessuna chiamata di rete e
-  l'app si comporta esattamente come senza questa funzione.
+- Il commento AI, l'import da foto e il verdetto giornaliero (tutti Google
+  Gemini, opzionali) sono puramente aggiuntivi: se `GEMINI_API_KEY` non è
+  impostata non fanno nessuna chiamata di rete e l'app si comporta
+  esattamente come senza queste funzioni.
+- Telegram (`TELEGRAM_BOT_TOKEN` + chat ID dalle Impostazioni) è un canale
+  di notifica aggiuntivo, non sostitutivo: `broadcast()` manda su mail e
+  Telegram insieme, ognuno dei due funziona anche da solo se l'altro non
+  è configurato.
+- L'import da foto stima la quantità di azioni come
+  `valore_posizione_€ / prezzo_di_mercato_attuale_in_€` (con conversione
+  EUR/USD live via il ticker Yahoo `EURUSD=X`, cache di un'ora): è una
+  stima, non un dato letto direttamente dallo screenshot, perché i broker
+  in genere non mostrano il numero di azioni nella vista elenco.
 - La ricerca ticker unisce un elenco locale di ~70 titoli comuni (sempre
   disponibile, istantaneo) ai risultati live della ricerca Yahoo quando
   raggiungibile — quindi i suggerimenti funzionano anche se Yahoo è

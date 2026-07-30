@@ -39,6 +39,11 @@ TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY", "")
 # funziona comunque, il commento AI è solo un testo in più.
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
+# Bot Telegram opzionale per ricevere i segnali lì invece (o oltre) che via
+# mail: crealo con @BotFather (vedi README) e incolla qui il token. Il
+# destinatario (chat_id) si imposta dalla UI dell'app, non da qui.
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+
 # NB: il ticker Yahoo/NYSE di Taiwan Semiconductor è "TSM", non "TSMC"
 # ("TSMC" non è un simbolo valido su nessun mercato e fallirebbe sempre).
 DEFAULT_TICKERS = ["MU", "ASML", "MSFT", "SNDK", "TSM"]
