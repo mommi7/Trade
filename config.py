@@ -59,3 +59,35 @@ DEFAULT_LEVELS = {
     "SNDK": {"buy": None, "sell": None, "qty": 0, "paid": 0},
     "TSM":  {"buy": None, "sell": None, "qty": 0, "paid": 0},
 }
+
+# --------------------------------------------------------------------------
+# Watchlist con soglie ingresso/stop/target (tab "🎯 Livelli").
+# --------------------------------------------------------------------------
+# Tutti i valori sono in EUR (l'app converte i prezzi live in EUR con il
+# tasso EURUSD=X per confrontarli, esattamente come nell'import da foto).
+# entry_low/entry_high = None significa "nessun limite da quel lato"
+#   (es. META ha solo entry_high=542 -> "ingresso sotto 542").
+# stop_pct / target_multiple: usati SOLO se manca il valore assoluto
+#   corrispondente, risolti in € concreti al primo avvio usando come
+#   riferimento entry_high (o il prezzo di mercato per entry_at_market=True).
+# entry_at_market=True: "ingresso al prezzo corrente" (es. NOK) — niente
+#   alert di ingresso (si considera già in posizione), si monitorano solo
+#   stop e target da quel momento.
+WATCH_LEVELS = [
+    {"ticker": "AVGO", "name": "Broadcom", "entry_low": 354, "entry_high": 363,
+     "stop_price": 313, "target_low": 460, "target_high": 460},
+    {"ticker": "META", "name": "Meta Platforms", "entry_low": None, "entry_high": 542,
+     "stop_price": 478, "target_low": 690, "target_high": 690},
+    {"ticker": "SOI.PA", "name": "Soitec", "entry_low": None, "entry_high": 147,
+     "stop_pct": -0.15, "target_multiple": 2.0},
+    {"ticker": "AAOI", "name": "Applied Optoelectronics", "entry_low": 87, "entry_high": 97,
+     "stop_price": 74, "target_low": 184, "target_high": 184},
+    {"ticker": "NOK", "name": "Nokia", "entry_at_market": True,
+     "stop_pct": -0.15, "target_low": 7.30, "target_high": 9.20},
+    {"ticker": "SNDK", "name": "SanDisk", "entry_low": 1020, "entry_high": 1080,
+     "stop_price": 809, "target_low": 1288, "target_high": 1288},
+    {"ticker": "CVX", "name": "Chevron", "entry_low": 170, "entry_high": 175,
+     "stop_price": 152, "target_low": 202, "target_high": 202},
+    {"ticker": "V", "name": "Visa", "entry_low": 336, "entry_high": 345,
+     "stop_price": 294, "target_low": 395, "target_high": 395},
+]

@@ -41,6 +41,10 @@ CACHE_LOCK = threading.Lock()
 # run_market_screener più sotto), servita da /api/opportunities.
 SCREENER_CACHE = {"results": [], "updated": None}
 
+# Cache in memoria dell'ultimo giro della watchlist ingresso/stop/target
+# (vedi check_watch_levels più sotto), servita da /api/watchlist.
+WATCHLIST_CACHE = {}
+
 
 # --------------------------------------------------------------------------
 # Database
@@ -88,6 +92,32 @@ def init_db():
             price REAL,
             triggered INTEGER DEFAULT 0,
             created DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS watch_levels (
+            id INTEGER PRIMARY KEY,
+            ticker TEXT UNIQUE,
+            name TEXT,
+            entry_low REAL,
+            entry_high REAL,
+            stop_price REAL,
+            target_low REAL,
+            target_high REAL,
+            reference_price REAL,
+            entry_notified INTEGER DEFAULT 0,
+            stop_notified INTEGER DEFAULT 0,
+            target_notified INTEGER DEFAULT 0,
+            active INTEGER DEFAULT 1,
+            created DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS watch_log (
+            id INTEGER PRIMARY KEY,
+            ticker TEXT,
+            signal_type TEXT,
+            price REAL,
+            message TEXT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
         );
         """
     )
@@ -1082,6 +1112,181 @@ def analyze_and_store(ticker, custom_buy, custom_sell):
 
 
 # --------------------------------------------------------------------------
+# Watchlist con soglie ingresso/stop/target (tab "🎯 Livelli")
+# --------------------------------------------------------------------------
+WATCH_EMOJI = {"entry": "🟢", "stop": "🔴", "target": "🎯"}
+WATCH_LABEL = {"entry": "SEGNALE INGRESSO", "stop": "ALERT STOP", "target": "PROFIT TARGET"}
+WATCH_ACTION = {"entry": "COMPRA", "stop": "VENDI", "target": "VENDI (prendi profitto)"}
+
+
+def _fmt_range(low, high):
+    if low is not None and high is not None and low != high:
+        return f"{low}–{high}"
+    if high is not None:
+        return str(high)
+    if low is not None:
+        return f">{low}"
+    return "—"
+
+
+def seed_watch_levels():
+    """Inserisce le righe di config.WATCH_LEVELS non ancora presenti,
+    risolvendo stop%/target-moltiplicatore in € concreti. Chiamata ad ogni
+    giro del monitor: è idempotente, se un ticker richiede un prezzo live
+    (es. NOK "a mercato") e la rete fallisce ora, riprova al giro dopo
+    invece di bloccare l'avvio dell'app."""
+    conn = get_db()
+    try:
+        existing = {r["ticker"] for r in conn.execute("SELECT ticker FROM watch_levels").fetchall()}
+    finally:
+        conn.close()
+
+    for spec in config.WATCH_LEVELS:
+        ticker = spec["ticker"]
+        if ticker in existing:
+            continue
+
+        entry_low = spec.get("entry_low")
+        entry_high = spec.get("entry_high")
+        stop_price = spec.get("stop_price")
+        target_low = spec.get("target_low")
+        target_high = spec.get("target_high")
+        entry_at_market = spec.get("entry_at_market", False)
+
+        reference_price = entry_high if entry_high is not None else entry_low
+        if entry_at_market or reference_price is None:
+            data = fetch_market_data(ticker)
+            if not data:
+                print(f"Watchlist: prezzo non disponibile per {ticker}, riprovo al prossimo giro")
+                continue
+            reference_price = to_eur(data["price"], data.get("currency", "USD"))
+
+        if stop_price is None and spec.get("stop_pct") is not None:
+            stop_price = round(reference_price * (1 + spec["stop_pct"]), 2)
+        if target_low is None and spec.get("target_multiple") is not None:
+            target_low = target_high = round(reference_price * spec["target_multiple"], 2)
+
+        conn = get_db()
+        try:
+            conn.execute(
+                """
+                INSERT INTO watch_levels
+                    (ticker, name, entry_low, entry_high, stop_price, target_low,
+                     target_high, reference_price, entry_notified, active)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                """,
+                (
+                    ticker, spec.get("name", ticker), entry_low, entry_high, stop_price,
+                    target_low, target_high, round(reference_price, 2),
+                    1 if entry_at_market else 0,  # "a mercato" = già considerato entrato
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def notify_watch_signal(row, signal_type, price):
+    ticker = row["ticker"]
+    name = row["name"] or ticker
+    ref = row["reference_price"]
+    move_txt = f" ({(price - ref) / ref * 100:+.1f}% dal riferimento {ref})" if ref else ""
+
+    subject = f"{WATCH_EMOJI[signal_type]} {WATCH_LABEL[signal_type]}: {ticker} a {price:.2f}€"
+    body = (
+        f"{ticker} ({name})\n"
+        f"Prezzo attuale: {price:.2f}€{move_txt}\n"
+        f"Segnale: {WATCH_LABEL[signal_type]}\n"
+        f"Azione consigliata: {WATCH_ACTION[signal_type]}\n\n"
+        f"Ingresso: {_fmt_range(row['entry_low'], row['entry_high'])}\n"
+        f"Stop: {row['stop_price']}\n"
+        f"Target: {_fmt_range(row['target_low'], row['target_high'])}\n\n"
+        f"Apri Cecchino: {config.PUBLIC_URL}"
+    )
+    broadcast(subject, body)
+
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO watch_log (ticker, signal_type, price, message) VALUES (?, ?, ?, ?)",
+        (ticker, signal_type, price, body),
+    )
+    conn.commit()
+    conn.close()
+
+
+def check_watch_levels():
+    """Confronta il prezzo live di ogni riga della watchlist con le sue
+    soglie e manda gli alert 🟢/🔴/🎯. Aggiorna sempre WATCHLIST_CACHE per
+    la dashboard, anche quando nessun segnale scatta."""
+    seed_watch_levels()
+
+    conn = get_db()
+    try:
+        rows = conn.execute("SELECT * FROM watch_levels WHERE active = 1 ORDER BY ticker").fetchall()
+    finally:
+        conn.close()
+
+    for row in rows:
+        try:
+            data = fetch_market_data(row["ticker"])
+            if not data:
+                continue
+            price = to_eur(data["price"], data.get("currency", "USD"))
+            if price is None:
+                continue
+
+            entry_low, entry_high = row["entry_low"], row["entry_high"]
+            in_entry_zone = False
+            if entry_low is not None and entry_high is not None:
+                in_entry_zone = entry_low <= price <= entry_high
+            elif entry_high is not None:
+                in_entry_zone = price <= entry_high
+
+            status = "IN ATTESA"
+            if row["stop_price"] is not None and price <= row["stop_price"]:
+                status = "STOP"
+            elif row["target_low"] is not None and price >= row["target_low"]:
+                status = "TARGET"
+            elif in_entry_zone:
+                status = "INGRESSO"
+
+            with CACHE_LOCK:
+                WATCHLIST_CACHE[row["ticker"]] = {
+                    "ticker": row["ticker"],
+                    "name": row["name"],
+                    "price": round(price, 2),
+                    "entry_low": entry_low,
+                    "entry_high": entry_high,
+                    "stop_price": row["stop_price"],
+                    "target_low": row["target_low"],
+                    "target_high": row["target_high"],
+                    "reference_price": row["reference_price"],
+                    "status": status,
+                    "dist_to_entry_pct": round((entry_high - price) / price * 100, 1) if entry_high else None,
+                    "dist_to_stop_pct": round((price - row["stop_price"]) / row["stop_price"] * 100, 1) if row["stop_price"] else None,
+                    "dist_to_target_pct": round((row["target_low"] - price) / price * 100, 1) if row["target_low"] else None,
+                    "updated": datetime.now().isoformat(timespec="seconds"),
+                }
+
+            conn = get_db()
+            try:
+                if row["stop_price"] is not None and price <= row["stop_price"] and not row["stop_notified"]:
+                    notify_watch_signal(row, "stop", price)
+                    conn.execute("UPDATE watch_levels SET stop_notified = 1 WHERE id = ?", (row["id"],))
+                elif row["target_low"] is not None and price >= row["target_low"] and not row["target_notified"]:
+                    notify_watch_signal(row, "target", price)
+                    conn.execute("UPDATE watch_levels SET target_notified = 1 WHERE id = ?", (row["id"],))
+                elif in_entry_zone and not row["entry_notified"]:
+                    notify_watch_signal(row, "entry", price)
+                    conn.execute("UPDATE watch_levels SET entry_notified = 1 WHERE id = ?", (row["id"],))
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception as e:
+            print(f"Errore watchlist per {row['ticker']}: {e}")
+
+
+# --------------------------------------------------------------------------
 # Monitor (ogni ora via thread locale, oppure via /api/cron/tick esterno)
 # --------------------------------------------------------------------------
 def refresh_all_portfolio():
@@ -1283,6 +1488,7 @@ def monitor_loop():
     while True:
         try:
             refresh_all_portfolio()
+            check_watch_levels()
             run_market_screener()
             generate_daily_verdict()
         except Exception as e:
@@ -1470,9 +1676,49 @@ def api_cron_tick():
     if not config.CRON_SECRET or secret != config.CRON_SECRET:
         return jsonify({"error": "unauthorized"}), 401
     refresh_all_portfolio()
+    check_watch_levels()
     run_market_screener()
     generate_daily_verdict()
     return jsonify({"ok": True})
+
+
+# --------------------------------------------------------------------------
+# API - Watchlist ingresso/stop/target
+# --------------------------------------------------------------------------
+@app.route("/api/watchlist", methods=["GET"])
+def api_watchlist_list():
+    with CACHE_LOCK:
+        cached = dict(WATCHLIST_CACHE)
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM watch_levels WHERE active = 1 ORDER BY ticker").fetchall()
+    conn.close()
+    out = []
+    for row in rows:
+        item = cached.get(row["ticker"], {
+            "ticker": row["ticker"], "name": row["name"], "price": None,
+            "entry_low": row["entry_low"], "entry_high": row["entry_high"],
+            "stop_price": row["stop_price"], "target_low": row["target_low"],
+            "target_high": row["target_high"], "status": "IN ATTESA", "updated": None,
+        })
+        out.append(item)
+    return jsonify(out)
+
+
+@app.route("/api/watchlist/refresh", methods=["POST"])
+def api_watchlist_refresh():
+    check_watch_levels()
+    with CACHE_LOCK:
+        return jsonify(list(WATCHLIST_CACHE.values()))
+
+
+@app.route("/api/watchlist/log", methods=["GET"])
+def api_watchlist_log():
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT * FROM watch_log ORDER BY timestamp DESC LIMIT 50"
+    ).fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows])
 
 
 # --------------------------------------------------------------------------
@@ -2138,11 +2384,28 @@ nav.bottom button.active { color: var(--blue); }
     <div id="opportunities-updated" class="dim" style="font-size:12px;margin-bottom:8px"></div>
     <div id="opportunities-list"></div>
   </div>
+
+  <!-- LIVELLI (watchlist ingresso/stop/target) -->
+  <div class="tab-view" id="tab-watchlist">
+    <div class="card">
+      <div class="row">
+        <div class="dim" style="font-size:12px">🎯 Titoli con soglie di ingresso/stop/target definite a mano. Alert 🟢 quando entra in zona ingresso, 🔴 se rompe lo stop, 🎯 se raggiunge il target — su mail e/o Telegram.</div>
+        <button class="secondary" onclick="refreshWatchlist()" style="white-space:nowrap">🔄 Aggiorna</button>
+      </div>
+    </div>
+    <div id="watchlist-updated" class="dim" style="font-size:12px;margin-bottom:8px"></div>
+    <div id="watchlist-list"></div>
+    <div class="card">
+      <b style="font-size:14px">📜 Ultimi segnali</b>
+      <div id="watchlist-log" style="margin-top:8px"></div>
+    </div>
+  </div>
 </div>
 
 <nav class="bottom">
   <button id="nav-scanner" class="active" onclick="showTab('scanner')">🔍 Scanner</button>
   <button id="nav-portfolio" onclick="showTab('portfolio')">💼 Portafoglio</button>
+  <button id="nav-watchlist" onclick="showTab('watchlist')">🎯 Livelli</button>
   <button id="nav-opportunities" onclick="showTab('opportunities')">💡 Opportunità</button>
   <button id="nav-alerts" onclick="showTab('alerts')">🔔 Alert</button>
   <button id="nav-history" onclick="showTab('history')">📜 Storico</button>
@@ -2359,6 +2622,7 @@ function showTab(name) {
   if (name === 'alerts') loadAlerts();
   if (name === 'history') loadHistory();
   if (name === 'opportunities') loadOpportunities();
+  if (name === 'watchlist') { loadWatchlist(); loadWatchlistLog(); }
 }
 
 function renderAnalysisCard(a, extraButtons) {
@@ -2570,6 +2834,76 @@ function renderOpportunities(data) {
     const btn = `<button style="margin-top:10px" onclick="quickAdd('${a.ticker}', ${a.price})">+ Aggiungi al portafoglio</button>`;
     return renderAnalysisCard(a, btn);
   }).join('');
+}
+
+const WATCH_STATUS_CLASS = {STOP: 'SELL', TARGET: 'BUY', INGRESSO: 'BUY', 'IN ATTESA': 'HOLD'};
+
+async function loadWatchlist() {
+  document.getElementById('watchlist-list').innerHTML = '<div class="spinner">Caricamento…</div>';
+  const res = await fetch('/api/watchlist');
+  renderWatchlist(await res.json());
+}
+
+async function refreshWatchlist() {
+  document.getElementById('watchlist-list').innerHTML = '<div class="spinner">Controllo prezzi in corso…</div>';
+  const res = await fetch('/api/watchlist/refresh', { method: 'POST' });
+  renderWatchlist(await res.json());
+  loadWatchlistLog();
+}
+
+function renderWatchlist(items) {
+  const container = document.getElementById('watchlist-list');
+  const updEl = document.getElementById('watchlist-updated');
+  if (!items || items.length === 0) {
+    container.innerHTML = '<div class="dim">Nessun titolo in watchlist.</div>';
+    updEl.textContent = '';
+    return;
+  }
+  const latest = items.map(i => i.updated).filter(Boolean).sort().pop();
+  updEl.textContent = latest ? `Ultimo controllo: ${latest.replace('T', ' ').slice(0, 16)}` : 'Non ancora controllato: premi "Aggiorna".';
+
+  container.innerHTML = items.map(a => {
+    const cls = WATCH_STATUS_CLASS[a.status] || 'HOLD';
+    const entryTxt = (a.entry_low != null && a.entry_high != null) ? `${a.entry_low}–${a.entry_high}`
+      : (a.entry_high != null ? `sotto ${a.entry_high}` : '—');
+    const targetTxt = (a.target_low != null && a.target_high != null && a.target_low !== a.target_high)
+      ? `${a.target_low}–${a.target_high}` : (a.target_low != null ? a.target_low : '—');
+    return `
+      <div class="card stripe ${cls}">
+        <div class="row">
+          <div>
+            <div class="ticker-name">${a.ticker} <span class="dim">${a.name || ''}</span></div>
+            <div class="dim">${a.price != null ? a.price + ' €' : 'prezzo non ancora controllato'}</div>
+          </div>
+          <span class="pill ${cls}">${a.status}</span>
+        </div>
+        <div class="metrics">
+          <div class="metric"><div class="val">${entryTxt}</div><div class="lbl">Ingresso €</div></div>
+          <div class="metric"><div class="val">${a.stop_price ?? '—'}</div><div class="lbl">Stop €</div></div>
+          <div class="metric"><div class="val">${targetTxt}</div><div class="lbl">Target €</div></div>
+          <div class="metric"><div class="val">${a.dist_to_entry_pct != null ? a.dist_to_entry_pct + '%' : '—'}</div><div class="lbl">a ingresso</div></div>
+          <div class="metric"><div class="val">${a.dist_to_stop_pct != null ? a.dist_to_stop_pct + '%' : '—'}</div><div class="lbl">sopra stop</div></div>
+          <div class="metric"><div class="val">${a.dist_to_target_pct != null ? a.dist_to_target_pct + '%' : '—'}</div><div class="lbl">a target</div></div>
+        </div>
+      </div>`;
+  }).join('');
+}
+
+async function loadWatchlistLog() {
+  const el = document.getElementById('watchlist-log');
+  el.innerHTML = '<div class="spinner">Caricamento…</div>';
+  const res = await fetch('/api/watchlist/log');
+  const log = await res.json();
+  if (!log.length) {
+    el.innerHTML = '<div class="dim">Nessun segnale ancora registrato.</div>';
+    return;
+  }
+  const emoji = {entry: '🟢', stop: '🔴', target: '🎯'};
+  el.innerHTML = log.map(l => `
+    <div class="row" style="padding:6px 0;border-bottom:1px solid var(--border)">
+      <span>${emoji[l.signal_type] || ''} <b>${l.ticker}</b> a ${l.price}€</span>
+      <span class="dim" style="font-size:11px">${l.timestamp}</span>
+    </div>`).join('');
 }
 </script>
 </body>

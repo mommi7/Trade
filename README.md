@@ -225,6 +225,16 @@ Configuralo così:
   "Opportunità" con lo stesso dettaglio delle altre card, pronto per
   essere aggiunto al portafoglio con un click. Una mail digest parte al
   massimo una volta al giorno per non spammarti.
+- **Livelli 🎯 (watchlist ingresso/stop/target)**: soglie di trading
+  definite a mano — zona di ingresso (es. 354–363), stop loss e target,
+  in € (assoluti o come % / moltiplicatore risolto automaticamente al
+  primo avvio, es. "-15%" o "raddoppio"). Ogni ora l'app controlla il
+  prezzo live di ognuno e manda un alert quando entra in zona ingresso
+  (🟢), rompe lo stop (🔴) o raggiunge il target (🎯) — su mail e/o
+  Telegram, ognuno una volta sola. La lista di default è configurabile in
+  `config.WATCH_LEVELS` in `config.py`. I prezzi live (spesso in USD)
+  vengono convertiti in € con lo stesso tasso EURUSD live usato
+  dall'import da foto, per confrontarli correttamente con le soglie.
 - **Ricerca ticker con suggerimenti**: scrivendo un simbolo o un nome
   (es. "micro", "bitcoin") negli input di Scanner, Portafoglio e Alert
   compare un menu a tendina con i titoli corrispondenti, da selezionare
