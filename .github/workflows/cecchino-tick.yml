@@ -18,6 +18,11 @@ name: Cecchino Pro - tick
 #   CECCHINO_URL          es. https://cecchino-pro.onrender.com
 #   CECCHINO_CRON_SECRET  stesso valore della variabile d'ambiente
 #                         CECCHINO_CRON_SECRET impostata su Render
+#
+# Opzionali, solo per ricevere un avviso su Telegram (invece che via mail
+# da GitHub) se il tick fallisce:
+#   TELEGRAM_BOT_TOKEN    stesso valore della variabile su Render
+#   TELEGRAM_CHAT_ID      il tuo chat ID (app -> Impostazioni ⚙️)
 
 on:
   schedule:
@@ -39,3 +44,18 @@ jobs:
         env:
           CECCHINO_URL: ${{ secrets.CECCHINO_URL }}
           CECCHINO_CRON_SECRET: ${{ secrets.CECCHINO_CRON_SECRET }}
+
+      - name: Avvisa su Telegram se il tick è fallito
+        if: failure()
+        run: |
+          if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+            echo "TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID non impostati come secrets: salto l'avviso Telegram."
+            exit 0
+          fi
+          curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            -d text="⚠️ Cecchino Pro: il tick automatico su GitHub Actions è fallito. Controlla che CECCHINO_URL e CECCHINO_CRON_SECRET siano corretti nei secrets del repo, e che il sito sia raggiungibile." \
+            || true
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}

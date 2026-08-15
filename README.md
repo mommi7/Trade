@@ -155,11 +155,26 @@ Configuralo così:
 
 1. Nel repo GitHub → **Settings** → **Secrets and variables** → **Actions**
    → **New repository secret**, aggiungi:
-   - `CECCHINO_URL` → es. `https://cecchino-pro.onrender.com`
+   - `CECCHINO_URL` → es. `https://cecchino-pro.onrender.com` (**senza** slash finale)
    - `CECCHINO_CRON_SECRET` → lo stesso valore che Render ha generato per
      `CECCHINO_CRON_SECRET` (Render → Environment, copialo da lì)
+   - Facoltativi, solo per ricevere un avviso su **Telegram** invece che
+     via mail da GitHub se il tick fallisce: `TELEGRAM_BOT_TOKEN` (stesso
+     valore di Render) e `TELEGRAM_CHAT_ID` (il tuo, visibile nell'app →
+     Impostazioni ⚙️)
 2. Il workflow parte da solo ogni 10 minuti. Puoi anche lanciarlo a mano da
-   **Actions** → **Cecchino Pro - tick orario** → **Run workflow**.
+   **Actions** → **Cecchino Pro - tick** → **Run workflow**.
+
+**Se vedi una mail di GitHub "All jobs have failed" e "Failed in 2
+seconds"**: un fallimento così veloce vuol dire che il workflow non è
+nemmeno arrivato a contattare il sito — quasi sempre perché uno dei due
+secrets del punto 1 manca o è scritto male (nome sbagliato, spazio in
+più, ecc.). Controllalo lì, non è un bug del codice.
+
+Quella mail in sé è **GitHub** che ti avvisa, non l'app: per smettere di
+riceverle (a prescindere dal motivo del fallimento) vai su
+github.com → foto profilo in alto a destra → **Settings** →
+**Notifications** → sezione **Actions** → togli la spunta a **Email**.
 
 ### Limiti del free tier (leggi prima di fidarti)
 
