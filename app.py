@@ -119,6 +119,16 @@ def init_db():
             message TEXT,
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
         );
+
+        CREATE TABLE IF NOT EXISTS screener_signals (
+            id INTEGER PRIMARY KEY,
+            ticker TEXT,
+            signal TEXT,
+            reasons TEXT,
+            week_key TEXT,
+            notified INTEGER DEFAULT 0,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
         """
     )
     conn.commit()
@@ -160,6 +170,9 @@ def init_db():
         "ALTER TABLE settings ADD COLUMN telegram_chat_id TEXT",
         "ALTER TABLE settings ADD COLUMN last_verdict_sent TEXT",
         "ALTER TABLE settings ADD COLUMN last_verdict_text TEXT",
+        "ALTER TABLE tickers ADD COLUMN owner TEXT",
+        "ALTER TABLE settings ADD COLUMN last_weekly_screener_sent TEXT",
+        "ALTER TABLE settings ADD COLUMN last_weekly_screener_results TEXT",
     ]:
         try:
             conn.execute(ddl)
@@ -168,6 +181,38 @@ def init_db():
 
     conn.commit()
     conn.close()
+
+
+def seed_screener_universe():
+    """Tagga nella tabella tickers i titoli "owned" dello screener a 25 con
+    il loro proprietario (mohamed/micaela/shared), per il calcolo della
+    concentrazione settoriale. Non tocca qty/paid se il titolo esiste già
+    (es. importato da foto): imposta solo owner. Se il titolo non esiste
+    ancora lo crea con qty=0/paid=0 — l'utente dovrà aggiornarli a mano o
+    con l'import da foto per avere P&L e concentrazione corretti."""
+    conn = get_db()
+    try:
+        for spec in config.SCREENER_UNIVERSE:
+            if spec["category"] != "owned":
+                continue
+            existing = conn.execute(
+                "SELECT id FROM tickers WHERE ticker = ?", (spec["ticker"],)
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    "UPDATE tickers SET owner = ? WHERE ticker = ?", (spec["owner"], spec["ticker"])
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO tickers (ticker, qty, paid, active, owner) VALUES (?, 0, 0, 1, ?)",
+                    (spec["ticker"], spec["owner"]),
+                )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+SCREENER_BY_TICKER = {s["ticker"]: s for s in config.SCREENER_UNIVERSE}
 
 
 def get_alert_email():
@@ -1372,6 +1417,322 @@ def run_market_screener(send_email=True):
     return top
 
 
+# --------------------------------------------------------------------------
+# Screener settimanale a 25 titoli con regole operative (tab "📅 Settimanale")
+# --------------------------------------------------------------------------
+def analyze_for_screener(ticker):
+    """Prezzo/RSI/medie/variazioni per il motore a regole. A differenza di
+    analyze_ticker() calcola anche la variazione a 5 giorni (regola 1,
+    anti-inseguimento) e non converte in €: qui i livelli sono in valuta
+    nativa (USD per quasi tutti), come scritti dall'utente."""
+    data = fetch_market_data(ticker)
+    if not data or len(data["closes"]) < 6:
+        return None
+    closes = data["closes"]
+    price = data["price"]
+    rsi = compute_rsi(closes, 14)
+    ma50 = statistics.mean(closes[-50:])
+    ma200 = statistics.mean(closes[-200:]) if len(closes) >= 200 else statistics.mean(closes)
+    chg_1d = (closes[-1] - closes[-2]) / closes[-2] * 100 if closes[-2] else 0
+    chg_5d = (closes[-1] - closes[-6]) / closes[-6] * 100 if closes[-6] else 0
+    return {
+        "ticker": ticker, "name": data["name"], "price": round(price, 2),
+        "currency": data.get("currency", "USD"), "rsi": round(rsi, 1),
+        "ma50": round(ma50, 2), "ma200": round(ma200, 2),
+        "chg_1d": round(chg_1d, 1), "chg_5d": round(chg_5d, 1),
+    }
+
+
+def _screener_entry_zone_text(spec):
+    lo, hi = spec.get("entry_low"), spec.get("entry_high")
+    if lo is not None and hi is not None:
+        return f"${lo}-{hi}"
+    if hi is not None:
+        return f"sotto ${hi}"
+    if lo is not None:
+        return f"sopra ${lo}"
+    return spec.get("entry_note", "n/d")
+
+
+def in_screener_entry_zone(spec, price):
+    """Zona di ingresso ± 3% (richiesto dal prompt). Se il livello è solo
+    una nota testuale (es. "su ritracciamento"), non c'è modo affidabile di
+    verificarlo a numeri: mai BUY automatico in quel caso, resta WATCH."""
+    lo, hi = spec.get("entry_low"), spec.get("entry_high")
+    if lo is not None and hi is not None:
+        return lo * 0.97 <= price <= hi * 1.03
+    if hi is not None:
+        return price <= hi * 1.03
+    if lo is not None:
+        return price >= lo * 0.97
+    return False
+
+
+def check_recent_event(ticker):
+    """Best-effort (regola 3): cerca le notizie più recenti su Yahoo e
+    chiede a Gemini se descrivono un evento reale di rottura tesi (miss,
+    guidance tagliata, downgrade multiplo) o solo rumore. Se manca
+    GEMINI_API_KEY, non si trovano notizie, o qualcosa fallisce, ritorna
+    None: nessun evento confermato, che blocca il SELL — la scelta sicura
+    richiesta esplicitamente dalla regola 3, non un'approssimazione pigra."""
+    if not config.GEMINI_API_KEY:
+        return None
+    try:
+        _warm_yahoo_session()
+        url = "https://query1.finance.yahoo.com/v1/finance/search"
+        r = YAHOO_SESSION.get(url, params={"q": ticker, "quotesCount": 0, "newsCount": 5}, timeout=8)
+        if r.status_code != 200:
+            return None
+        news = r.json().get("news", [])
+        if not news:
+            return None
+        headlines = "\n".join(f"- {n.get('title', '')}" for n in news[:5])
+        prompt = (
+            f"Notizie più recenti trovate per il titolo {ticker}:\n{headlines}\n\n"
+            'Rispondi SOLO con JSON: {"is_break": true/false, "description": "..."}. '
+            "is_break=true SOLO se una di queste notizie descrive un evento concreto di "
+            "rottura della tesi d'investimento: earnings mancati, guidance tagliata, "
+            "downgrade multiplo di analisti, causa legale grave, cambio CEO improvviso "
+            "negativo. Notizie generiche, movimenti di prezzo, opinioni o rumor NON "
+            "contano: in quel caso is_break=false."
+        )
+        gurl = (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            f"gemini-2.0-flash:generateContent?key={config.GEMINI_API_KEY}"
+        )
+        gr = requests.post(gurl, json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=15)
+        if gr.status_code != 200:
+            return None
+        text = gr.json()["candidates"][0]["content"]["parts"][0]["text"]
+        text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
+        parsed = json.loads(text)
+        return parsed if parsed.get("is_break") else None
+    except Exception as e:
+        print(f"Errore check_recent_event per {ticker}: {e}")
+        return None
+
+
+def compute_screener_signal(spec, analysis, recent_event=None):
+    """Applica le 7 regole operative del desk. Ritorna (signal, reasons)."""
+    if spec["category"] == "excluded":
+        return "ESCLUSO", [spec.get("exclusion_reason", "Titolo scartato in analisi precedente")]
+
+    price, rsi, chg_5d = analysis["price"], analysis["rsi"], analysis["chg_5d"]
+    post_jump = chg_5d is not None and chg_5d >= config.POST_JUMP_THRESHOLD_PCT  # regola 1
+    fcf_negative = spec.get("fcf_negative", False)  # regola 2
+
+    if spec["category"] == "owned":
+        if spec.get("never_sell"):  # regola 5
+            return "HOLD", [f"{spec.get('role', '')} — mai in vendita per policy"]
+        if recent_event:  # regola 3: SELL solo su evento reale confermato
+            return "SELL", [f"Evento reale rilevato: {recent_event.get('description', 'vedi notizie')} — rivedi la tesi"]
+        reasons = ["In portafoglio, nessun evento di rottura tesi confermato nelle "
+                   "ultime 48h: resta HOLD anche se il prezzo è sceso"]
+        if post_jump:
+            reasons.append(f"+{chg_5d:.1f}% negli ultimi 5gg: non aggiungere qui, lascia assestare")
+        return "HOLD", reasons
+
+    # watchlist
+    reasons = []
+    if spec.get("no_retrade"):
+        return "WATCH", [f"{spec.get('note', '')} — richiede conferma esplicita, mai BUY automatico"]
+
+    entry_ok = in_screener_entry_zone(spec, price)
+    if not entry_ok:
+        return "WATCH", [f"Fuori dalla zona di ingresso ({_screener_entry_zone_text(spec)}), prezzo attuale {price}"]
+
+    if post_jump:
+        return "WATCH", [f"+{chg_5d:.1f}% negli ultimi 5gg — balzo da lasciar assestare (regola anti-inseguimento)"]
+
+    if fcf_negative:
+        return "WATCH", ["FCF negativo — segnale limitato a WATCH finché non torna positivo"]
+
+    if not (25 <= rsi <= 55):
+        return "WATCH", [f"In zona ingresso ma RSI {rsi} fuori dal range 25-55 richiesto per BUY forte"]
+
+    catalyst_date = spec.get("catalyst_date")
+    has_catalyst = False
+    if catalyst_date:
+        try:
+            days_to = (datetime.strptime(catalyst_date, "%Y-%m-%d").date() - datetime.now().date()).days
+            has_catalyst = 0 <= days_to <= config.CATALYST_WINDOW_DAYS
+        except ValueError:
+            pass
+    if not has_catalyst:
+        return "WATCH", [
+            "In zona ingresso e RSI ok, ma nessun catalizzatore datato entro 6 settimane "
+            "(il target di consenso analisti non è disponibile gratis per verificare lo "
+            "sconto del 20%): resta WATCH finché non c'è una data"
+        ]
+
+    return "BUY_FORTE", [
+        f"In zona ingresso ({_screener_entry_zone_text(spec)}), RSI {rsi} nel range, "
+        f"5gg {chg_5d:+.1f}%, catalizzatore entro 6 settimane ({catalyst_date})"
+    ]
+
+
+def compute_screener_concentration(owner):
+    """Peso % per settore (regola 4) per un proprietario, sulle posizioni
+    possedute (qty > 0) taggate con quell'owner o condivise."""
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM tickers WHERE active = 1 AND qty > 0 AND (owner = ? OR owner = 'shared')",
+            (owner,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    sector_value, total = {}, 0.0
+    for row in rows:
+        with CACHE_LOCK:
+            cached = LAST_ANALYSIS.get(row["ticker"])
+        if not cached or "error" in cached:
+            continue
+        value = cached["price"] * row["qty"]
+        total += value
+        sector = SCREENER_BY_TICKER.get(row["ticker"], {}).get("sector", "Altro")
+        sector_value[sector] = sector_value.get(sector, 0) + value
+
+    if not total:
+        return {}
+    return {s: round(v / total * 100, 1) for s, v in sector_value.items()}
+
+
+def notify_weekly_report(results, concentration_alerts):
+    buy = [r for r in results if r["signal"] == "BUY_FORTE"][: config.MAX_BUY_PER_WEEK]
+    watch = [r for r in results if r["signal"] == "WATCH"]
+    sell = [r for r in results if r["signal"] == "SELL"]
+
+    lines = ["📅 CECCHINO — Report settimanale\n"]
+    if buy:
+        lines.append(f"🟢 BUY FORTE (max {config.MAX_BUY_PER_WEEK}):")
+        for r in buy:
+            lines.append(f"  {r['ticker']} a {r['price']} — {r['reasons'][0]}")
+    else:
+        lines.append("🟢 Nessun BUY FORTE questa settimana.")
+
+    if sell:
+        lines.append("\n🔴 SELL (evento confermato):")
+        for r in sell:
+            lines.append(f"  {r['ticker']} a {r['price']} — {r['reasons'][0]}")
+
+    if concentration_alerts:
+        lines.append("\n⚠️ ALERT CONCENTRAZIONE:")
+        for a in concentration_alerts:
+            lines.append(f"  {a}")
+
+    others = len(results) - len(buy) - len(sell)
+    lines.append(f"\n📋 Altri {others} titoli in WATCH/HOLD/coda — dettagli sul sito, tab Settimanale.")
+    lines.append("\nMonitoraggio, non consiglio finanziario. Nessuna operazione automatica.")
+
+    broadcast("📅 CECCHINO: report settimanale", "\n".join(lines))
+
+
+def run_weekly_screener(send=True, force=False):
+    """Girano tutte le 7 regole sui 25 titoli. Il report completo (con
+    notifica) parte solo il lunedì, salvo force=True per un refresh manuale
+    dalla UI (che aggiorna comunque la cache ma non rimanda la notifica se
+    già inviata questa settimana)."""
+    seed_screener_universe()
+
+    week_key = datetime.now().strftime("%Y-W%W")
+    results = []
+    for spec in config.SCREENER_UNIVERSE:
+        if spec["category"] == "excluded":
+            results.append({
+                "ticker": spec["ticker"], "name": spec["name"], "category": "excluded",
+                "signal": "ESCLUSO", "reasons": [spec.get("exclusion_reason", "")],
+                "price": None, "sector": spec.get("sector"),
+            })
+            continue
+        try:
+            analysis = analyze_for_screener(spec["ticker"])
+        except Exception as e:
+            print(f"Errore screener settimanale per {spec['ticker']}: {e}")
+            analysis = None
+        if not analysis:
+            results.append({
+                "ticker": spec["ticker"], "name": spec.get("name", spec["ticker"]),
+                "category": spec["category"], "signal": "N/D",
+                "reasons": ["Dati non disponibili"], "price": None, "sector": spec.get("sector"),
+            })
+            continue
+
+        recent_event = check_recent_event(spec["ticker"]) if spec["category"] == "owned" else None
+        signal, reasons = compute_screener_signal(spec, analysis, recent_event)
+        results.append({
+            "ticker": spec["ticker"], "name": spec.get("name", spec["ticker"]),
+            "category": spec["category"], "owner": spec.get("owner"), "sector": spec.get("sector"),
+            "signal": signal, "reasons": reasons, "price": analysis["price"],
+            "currency": analysis["currency"], "rsi": analysis["rsi"], "chg_5d": analysis["chg_5d"],
+        })
+
+    concentration = {
+        "mohamed": compute_screener_concentration("mohamed"),
+        "micaela": compute_screener_concentration("micaela"),
+    }
+    concentration_alerts = []
+    for owner, sectors in concentration.items():
+        for sector, pct in sectors.items():
+            if pct > config.SECTOR_CONCENTRATION_LIMIT_PCT:
+                concentration_alerts.append(
+                    f"{owner.capitalize()}: {sector} al {pct}% (limite {config.SECTOR_CONCENTRATION_LIMIT_PCT:.0f}%)"
+                )
+
+    payload = {"results": results, "concentration": concentration,
+               "concentration_alerts": concentration_alerts,
+               "updated": datetime.now().isoformat(timespec="seconds"), "week_key": week_key}
+
+    conn = get_db()
+    try:
+        conn.execute(
+            "INSERT INTO settings (id, last_weekly_screener_results) VALUES (1, ?) "
+            "ON CONFLICT(id) DO UPDATE SET last_weekly_screener_results = excluded.last_weekly_screener_results",
+            (json.dumps(payload, ensure_ascii=False),),
+        )
+        conn.commit()
+
+        is_monday = datetime.now().weekday() == 0
+        if send and (is_monday or force):
+            row = conn.execute("SELECT last_weekly_screener_sent FROM settings WHERE id = 1").fetchone()
+            already_sent = row and row["last_weekly_screener_sent"] == week_key
+            if not already_sent:
+                notify_weekly_report(results, concentration_alerts)
+                conn.execute(
+                    "UPDATE settings SET last_weekly_screener_sent = ? WHERE id = 1", (week_key,)
+                )
+                conn.commit()
+    finally:
+        conn.close()
+
+    return payload
+
+
+def maybe_run_weekly_screener():
+    """Richiamata dal monitor orario/cron: calcola lo screener a 25 titoli
+    al massimo una volta al giorno (non ad ogni tick), e con notifica solo
+    il lunedì — il costo (fetch + chiamate Gemini) non giustifica girarlo
+    più spesso. Il refresh manuale dalla UI chiama invece run_weekly_screener
+    direttamente, sempre, ignorando questo limite."""
+    conn = get_db()
+    row = conn.execute("SELECT last_weekly_screener_results FROM settings WHERE id = 1").fetchone()
+    conn.close()
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    last_date = None
+    if row and row["last_weekly_screener_results"]:
+        try:
+            last_date = json.loads(row["last_weekly_screener_results"]).get("updated", "")[:10]
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    if last_date == today:
+        return  # già calcolato oggi
+    if datetime.now().weekday() == 0 or last_date is None:
+        run_weekly_screener(send=True)
+
+
 def generate_daily_verdict(send=True):
     """Verdetto giornaliero AI (Gemini) sull'intero portafoglio: per ogni
     posizione un giudizio COMPRA/AUMENTA/TIENI/RIDUCI/VENDI basato sui
@@ -1491,6 +1852,7 @@ def monitor_loop():
             check_watch_levels()
             run_market_screener()
             generate_daily_verdict()
+            maybe_run_weekly_screener()
         except Exception as e:
             print(f"Errore monitor (riprova in 5 min): {e}")
             time.sleep(300)
@@ -1679,7 +2041,27 @@ def api_cron_tick():
     check_watch_levels()
     run_market_screener()
     generate_daily_verdict()
+    maybe_run_weekly_screener()
     return jsonify({"ok": True})
+
+
+# --------------------------------------------------------------------------
+# API - Screener settimanale a 25 titoli
+# --------------------------------------------------------------------------
+@app.route("/api/screener25", methods=["GET"])
+def api_screener25_get():
+    conn = get_db()
+    row = conn.execute("SELECT last_weekly_screener_results FROM settings WHERE id = 1").fetchone()
+    conn.close()
+    if not row or not row["last_weekly_screener_results"]:
+        return jsonify({"results": [], "concentration": {}, "concentration_alerts": [], "updated": None})
+    return jsonify(json.loads(row["last_weekly_screener_results"]))
+
+
+@app.route("/api/screener25/refresh", methods=["POST"])
+def api_screener25_refresh():
+    payload = run_weekly_screener(send=False)
+    return jsonify(payload)
 
 
 # --------------------------------------------------------------------------
@@ -2164,12 +2546,14 @@ nav.bottom {
 }
 nav.bottom button {
   flex: 1;
+  min-width: 0;
   background: transparent;
   border-radius: 0;
   color: var(--dim);
-  padding: 12px 4px;
-  font-size: 12px;
+  padding: 10px 2px;
+  font-size: 10px;
   font-weight: 600;
+  line-height: 1.3;
 }
 nav.bottom button.active { color: var(--blue); }
 
@@ -2400,12 +2784,27 @@ nav.bottom button.active { color: var(--blue); }
       <div id="watchlist-log" style="margin-top:8px"></div>
     </div>
   </div>
+
+  <!-- SETTIMANALE (screener a 25 titoli con le 7 regole operative) -->
+  <div class="tab-view" id="tab-screener25">
+    <div class="card">
+      <div class="row">
+        <div class="dim" style="font-size:12px">📅 25 titoli — 7 in portafoglio, 15 in watchlist, 7 da evitare — con le regole anti-inseguimento, filtro FCF, concentrazione settoriale e massimo 2 BUY a settimana. Report completo automatico il lunedì.</div>
+        <button class="secondary" onclick="refreshScreener25()" style="white-space:nowrap">🔄 Aggiorna</button>
+      </div>
+    </div>
+    <div id="screener25-updated" class="dim" style="font-size:12px;margin-bottom:8px"></div>
+    <div id="screener25-concentration"></div>
+    <div id="screener25-buy"></div>
+    <div id="screener25-list"></div>
+  </div>
 </div>
 
 <nav class="bottom">
   <button id="nav-scanner" class="active" onclick="showTab('scanner')">🔍 Scanner</button>
   <button id="nav-portfolio" onclick="showTab('portfolio')">💼 Portafoglio</button>
   <button id="nav-watchlist" onclick="showTab('watchlist')">🎯 Livelli</button>
+  <button id="nav-screener25" onclick="showTab('screener25')">📅 Settimanale</button>
   <button id="nav-opportunities" onclick="showTab('opportunities')">💡 Opportunità</button>
   <button id="nav-alerts" onclick="showTab('alerts')">🔔 Alert</button>
   <button id="nav-history" onclick="showTab('history')">📜 Storico</button>
@@ -2623,6 +3022,7 @@ function showTab(name) {
   if (name === 'history') loadHistory();
   if (name === 'opportunities') loadOpportunities();
   if (name === 'watchlist') { loadWatchlist(); loadWatchlistLog(); }
+  if (name === 'screener25') loadScreener25();
 }
 
 function renderAnalysisCard(a, extraButtons) {
@@ -2904,6 +3304,88 @@ async function loadWatchlistLog() {
       <span>${emoji[l.signal_type] || ''} <b>${l.ticker}</b> a ${l.price}€</span>
       <span class="dim" style="font-size:11px">${l.timestamp}</span>
     </div>`).join('');
+}
+
+const SCREENER25_CLASS = {BUY_FORTE: 'BUY', WATCH: 'HOLD', HOLD: 'HOLD', SELL: 'SELL', ESCLUSO: 'SELL', 'N/D': 'HOLD'};
+const SCREENER25_MAX_BUY = 2;
+
+async function loadScreener25() {
+  document.getElementById('screener25-list').innerHTML = '<div class="spinner">Caricamento…</div>';
+  const res = await fetch('/api/screener25');
+  renderScreener25(await res.json());
+}
+
+async function refreshScreener25() {
+  document.getElementById('screener25-list').innerHTML = '<div class="spinner">Scansione dei 25 titoli in corso, può richiedere qualche minuto…</div>';
+  const res = await fetch('/api/screener25/refresh', { method: 'POST' });
+  renderScreener25(await res.json());
+}
+
+function screener25Card(r, extraBadge) {
+  const cls = SCREENER25_CLASS[r.signal] || 'HOLD';
+  const priceTxt = r.price != null ? `${r.price} ${r.currency || ''}` : 'dati non disponibili';
+  return `
+    <div class="card stripe ${cls}">
+      <div class="row">
+        <div>
+          <div class="ticker-name">${r.ticker} <span class="dim">${r.name || ''}</span></div>
+          <div class="dim">${priceTxt}${r.chg_5d != null ? ' · 5gg ' + (r.chg_5d >= 0 ? '+' : '') + r.chg_5d + '%' : ''}</div>
+        </div>
+        <span class="pill ${cls}">${extraBadge || r.signal.replace('_', ' ')}</span>
+      </div>
+      <div class="reasons">${(r.reasons || []).map(x => `<div>• ${x}</div>`).join('')}</div>
+    </div>`;
+}
+
+function renderScreener25(data) {
+  document.getElementById('screener25-updated').textContent = data.updated
+    ? `Ultimo calcolo: ${data.updated.replace('T', ' ').slice(0, 16)} (settimana ${data.week_key || ''})`
+    : 'Non ancora calcolato: premi "Aggiorna" oppure attendi il report automatico di lunedì.';
+
+  const concEl = document.getElementById('screener25-concentration');
+  if (data.concentration_alerts && data.concentration_alerts.length) {
+    concEl.innerHTML = `<div class="card" style="border-color:var(--sell)">
+      <b style="color:var(--sell)">⚠️ Concentrazione oltre soglia</b>
+      <div class="dim" style="margin-top:6px">${data.concentration_alerts.join('<br>')}</div>
+    </div>`;
+  } else {
+    concEl.innerHTML = '';
+  }
+
+  const results = data.results || [];
+  const buyAll = results.filter(r => r.signal === 'BUY_FORTE');
+  const buyTop = buyAll.slice(0, SCREENER25_MAX_BUY);
+  const buyRest = buyAll.slice(SCREENER25_MAX_BUY);
+
+  const buyEl = document.getElementById('screener25-buy');
+  if (buyTop.length) {
+    buyEl.innerHTML = `<div class="dim" style="font-size:12px;margin:10px 0 6px">🟢 BUY FORTE (max ${SCREENER25_MAX_BUY} a settimana)</div>`
+      + buyTop.map(r => screener25Card(r)).join('')
+      + (buyRest.length ? `<div class="dim" style="font-size:12px;margin:6px 0">${buyRest.length} altri BUY validi ma in coda questa settimana: ${buyRest.map(r => r.ticker).join(', ')}</div>` : '');
+  } else {
+    buyEl.innerHTML = '';
+  }
+
+  const owned = results.filter(r => r.category === 'owned');
+  const watchlist = results.filter(r => r.category === 'watchlist' && r.signal !== 'BUY_FORTE');
+  const excluded = results.filter(r => r.category === 'excluded');
+
+  let html = '';
+  if (owned.length) {
+    html += '<div class="dim" style="font-size:12px;margin:10px 0 6px">🏠 Portafoglio</div>' + owned.map(r => screener25Card(r)).join('');
+  }
+  if (watchlist.length) {
+    html += '<div class="dim" style="font-size:12px;margin:10px 0 6px">👀 Watchlist</div>' + watchlist.map(r => screener25Card(r)).join('');
+  }
+  if (excluded.length) {
+    html += '<div class="dim" style="font-size:12px;margin:10px 0 6px">🚫 Da evitare (non suggeriti anche se lo screener li troverebbe validi)</div>'
+      + excluded.map(r => `
+        <div class="card" style="padding:10px 14px">
+          <div class="row"><b>${r.ticker}</b><span class="dim">${r.name || ''}</span></div>
+          <div class="dim" style="font-size:12px;margin-top:4px">${r.reasons[0] || ''}</div>
+        </div>`).join('');
+  }
+  document.getElementById('screener25-list').innerHTML = html || '<div class="dim">Nessun dato ancora calcolato.</div>';
 }
 </script>
 </body>

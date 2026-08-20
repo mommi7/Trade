@@ -91,3 +91,96 @@ WATCH_LEVELS = [
     {"ticker": "V", "name": "Visa", "entry_low": 336, "entry_high": 345,
      "stop_price": 294, "target_low": 395, "target_high": 395},
 ]
+
+# --------------------------------------------------------------------------
+# Screener settimanale a 25 titoli con regole operative (tab "📅 Settimanale")
+# --------------------------------------------------------------------------
+# category: "owned" (già in portafoglio) / "watchlist" (da valutare) /
+#           "excluded" (scartati: mai suggeriti anche se lo screener
+#           generico li troverebbe altrimenti validi).
+# owner (solo per "owned"): "mohamed" / "micaela" / "shared" — usato per il
+# controllo di concentrazione per settore, calcolato separatamente per i
+# due portafogli. entry_low/entry_high sono in USD (valuta nativa dei
+# titoli), non convertiti in €.
+#
+# fcf_negative / catalyst_date / role / note / exclusion_reason: dati che
+# l'utente ha già verificato a mano. yfinance/Yahoo non espone FCF, date
+# earnings o target di consenso analisti in modo affidabile e gratuito,
+# quindi qui sono flag statici da aggiornare tu quando cambiano, non dati
+# "live" — sarebbe disonesto far finta di poterli scaricare gratis in modo
+# solido.
+SCREENER_UNIVERSE = [
+    # --- Già in portafoglio ---
+    {"ticker": "ASML", "name": "ASML Holding", "category": "owned", "owner": "shared",
+     "sector": "Semiconduttori/Memoria", "role": "Core - monopolio EUV"},
+    {"ticker": "MSFT", "name": "Microsoft", "category": "owned", "owner": "shared",
+     "sector": "Cloud/Software", "role": "Core - cloud Azure"},
+    {"ticker": "GOOGL", "name": "Alphabet", "category": "owned", "owner": "shared",
+     "sector": "Cloud/Software", "role": "Core - search/AI"},
+    {"ticker": "JNJ", "name": "Johnson & Johnson", "category": "owned", "owner": "shared",
+     "sector": "Difensivo", "role": "DIFENSIVO - non vendere mai", "never_sell": True},
+    {"ticker": "000660.KS", "name": "SK Hynix", "category": "owned", "owner": "mohamed",
+     "sector": "Semiconduttori/Memoria", "role": "Core - memoria, PE più basso"},
+    {"ticker": "INTU", "name": "Intuit", "category": "owned", "owner": "micaela",
+     "sector": "Cloud/Software", "role": "Core - software fiscale, upside 76%"},
+    {"ticker": "JD", "name": "JD.com", "category": "owned", "owner": "micaela",
+     "sector": "E-commerce Asia", "role": "Core - e-commerce Cina, Burry top-3"},
+
+    # --- Watchlist: non ancora comprati ---
+    {"ticker": "AVGO", "name": "Broadcom", "category": "watchlist", "sector": "Semiconduttori/Memoria",
+     "entry_note": "Su ritracciamento dopo earnings 2 set", "note": "AI networking +200% guidance",
+     "catalyst_date": "2026-09-02"},
+    {"ticker": "ORCL", "name": "Oracle", "category": "watchlist", "sector": "Cloud/Software",
+     "entry_high": 136, "note": "RPO $638mld ma FCF negativo -23.7mld", "fcf_negative": True},
+    {"ticker": "NOW", "name": "ServiceNow", "category": "watchlist", "sector": "Cloud/Software",
+     "entry_low": 107, "entry_high": 115, "note": "Sconto -37/45%, numeri reali +24.5%"},
+    {"ticker": "SOLS", "name": "Solstice Advanced Materials", "category": "watchlist", "sector": "Materiali critici",
+     "entry_high": 55, "note": "Monopolio nucleare USA, rischio deal Element Solutions"},
+    {"ticker": "MP", "name": "MP Materials", "category": "watchlist", "sector": "Materiali critici",
+     "entry_note": "Su ritracciamento", "note": "Unico USA terre rare, FCF negativo fino 2028",
+     "fcf_negative": True},
+    {"ticker": "XYL", "name": "Xylem", "category": "watchlist", "sector": "Materiali critici",
+     "entry_note": "Prezzo corrente", "note": "Acqua/data center cooling, compounder lento"},
+    {"ticker": "FTNT", "name": "Fortinet", "category": "watchlist", "sector": "Cloud/Software",
+     "entry_note": "~$95 già ragionevole", "note": "Cybersecurity, il più a sconto del settore"},
+    {"ticker": "CRWD", "name": "CrowdStrike", "category": "watchlist", "sector": "Cloud/Software",
+     "entry_note": "Solo su correzione forte", "note": "Già premium anche dopo calo"},
+    {"ticker": "ZS", "name": "Zscaler", "category": "watchlist", "sector": "Cloud/Software",
+     "entry_note": "Dopo -50% dal picco 2025", "note": "Miglior punto ingresso storico"},
+    {"ticker": "ZTS", "name": "Zoetis", "category": "watchlist", "sector": "Difensivo",
+     "entry_note": "Prezzo corrente", "note": "-30% a maggio, Burry ha comprato"},
+    {"ticker": "VRTX", "name": "Vertex Pharmaceuticals", "category": "watchlist", "sector": "Difensivo",
+     "entry_note": "Su pullback", "note": "Monopolio fibrosi cistica"},
+    {"ticker": "LMT", "name": "Lockheed Martin", "category": "watchlist", "sector": "Difesa",
+     "entry_note": "Prezzo corrente", "note": "Backlog $194mld, PE 17x, il più economico difesa"},
+    {"ticker": "RTX", "name": "RTX Corporation", "category": "watchlist", "sector": "Difesa",
+     "entry_note": "Prezzo corrente", "note": "Backlog $271mld, diversificato"},
+    {"ticker": "MU", "name": "Micron", "category": "watchlist", "sector": "Semiconduttori/Memoria",
+     "entry_note": "NON RITRADARE - solo se tesi confermata", "note": "Storia di 8 round-trip falliti, Burry short",
+     "no_retrade": True},
+    {"ticker": "BABA", "name": "Alibaba", "category": "watchlist", "sector": "E-commerce Asia",
+     "entry_note": "Dopo earnings fine agosto", "note": "FCF negativo, Burry però è long",
+     "fcf_negative": True, "catalyst_date": "2026-08-29"},
+
+    # --- Da evitare: mai suggeriti, anche se lo screener li troverebbe validi ---
+    {"ticker": "SPCX", "name": "SpaceX", "category": "excluded",
+     "exclusion_reason": "Lock-up in corso fino dicembre 2026, pressione offerta "
+                          "(NB: verifica il ticker, SpaceX non è quotata pubblicamente)"},
+    {"ticker": "GPRO", "name": "GoPro", "category": "excluded",
+     "exclusion_reason": "Going concern doubt, patrimonio netto negativo"},
+    {"ticker": "RKLB", "name": "Rocket Lab", "category": "excluded",
+     "exclusion_reason": "PE negativo, EBITDA -175mln, beta 3.30"},
+    {"ticker": "SMCI", "name": "Super Micro", "category": "excluded",
+     "exclusion_reason": "Diluizione $7mld annunciata, indagine DOJ"},
+    {"ticker": "MRNA", "name": "Moderna", "category": "excluded",
+     "exclusion_reason": "FCF negativo, non comprare su balzi verticali +80%+ in un giorno"},
+    {"ticker": "PLTR", "name": "Palantir", "category": "excluded",
+     "exclusion_reason": "Troppo caro (90-150x), ADX collassato"},
+    {"ticker": "NVO", "name": "Novo Nordisk", "category": "excluded",
+     "exclusion_reason": "Trial falliti 2 volte in 8 mesi, guidance tagliata ripetutamente"},
+]
+
+SECTOR_CONCENTRATION_LIMIT_PCT = 40.0  # regola 4
+MAX_BUY_PER_WEEK = 2                   # regola 7
+POST_JUMP_THRESHOLD_PCT = 15.0         # regola 1: +15% in una seduta = non inseguire
+CATALYST_WINDOW_DAYS = 42              # regola 6: 6 settimane

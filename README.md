@@ -250,6 +250,31 @@ github.com → foto profilo in alto a destra → **Settings** →
   `config.WATCH_LEVELS` in `config.py`. I prezzi live (spesso in USD)
   vengono convertiti in € con lo stesso tasso EURUSD live usato
   dall'import da foto, per confrontarli correttamente con le soglie.
+- **Settimanale 📅 (screener a 25 titoli con regole operative)**: un
+  paniere curato — 7 titoli già in portafoglio, 15 in watchlist con
+  livello di ingresso, 7 scartati e mai risuggeriti — con 7 regole che
+  filtrano i segnali invece di limitarsi a mostrarli:
+  1. **Anti-inseguimento**: +15% o più in 5 giorni di borsa → mai BUY,
+     solo WATCH finché il balzo non si assesta.
+  2. **Filtro FCF**: cash flow libero negativo (flag impostato a mano,
+     vedi nota sotto) → mai BUY forte, solo WATCH.
+  3. **No vendita da rumore**: un titolo posseduto non genera mai SELL per
+     un semplice calo di prezzo. Serve un evento reale confermato (miss,
+     guidance tagliata, downgrade) nelle notizie delle ultime 48h — best
+     effort via Gemini se configurato, altrimenti resta sempre HOLD.
+  4. **Concentrazione per portafoglio**: alert se un settore supera il
+     40% per Mohamed o per Micaela separatamente (vedi owner più sotto).
+  5. **JNJ mai in SELL**: è l'ancora difensiva, esclusa a prescindere.
+  6. **Catalizzatore richiesto per BUY forte**: serve una data di
+     earnings/evento entro 6 settimane; senza data resta WATCH anche se
+     tutto il resto torna (il target di consenso analisti per lo sconto
+     del 20% non è disponibile gratis in modo affidabile).
+  7. **Massimo 2 BUY evidenziati a settimana**: gli altri restano "in
+     coda" anche se validi.
+  Report completo con notifica automatica **solo il lunedì** (il calcolo
+  costa diverse chiamate, non gira ogni ora); refresh manuale sempre
+  disponibile dal pulsante nel tab. Il paniere e i flag FCF/data
+  catalizzatore si aggiornano in `config.SCREENER_UNIVERSE`.
 - **Ricerca ticker con suggerimenti**: scrivendo un simbolo o un nome
   (es. "micro", "bitcoin") negli input di Scanner, Portafoglio e Alert
   compare un menu a tendina con i titoli corrispondenti, da selezionare
@@ -326,10 +351,28 @@ condiviso).
   giorni) che conferma la direzione del prezzo del giorno rafforza o
   indebolisce lo score. Nella card di analisi vedi anche le "zone"
   acquisto/vendita 🤖, calcolate automaticamente dal range a 52 settimane.
-- Il commento AI, l'import da foto e il verdetto giornaliero (tutti Google
-  Gemini, opzionali) sono puramente aggiuntivi: se `GEMINI_API_KEY` non è
-  impostata non fanno nessuna chiamata di rete e l'app si comporta
-  esattamente come senza queste funzioni.
+- Il commento AI, l'import da foto, il verdetto giornaliero e il controllo
+  eventi del report settimanale (tutti Google Gemini, opzionali) sono
+  puramente aggiuntivi: se `GEMINI_API_KEY` non è impostata non fanno
+  nessuna chiamata di rete e l'app si comporta esattamente come senza
+  queste funzioni.
+- Due portafogli in un'app a singolo tenant: la tabella `tickers` ha una
+  colonna `owner` (`mohamed`/`micaela`/`shared`) usata solo dal controllo
+  di concentrazione dello screener a 25 titoli, non un vero multi-utente —
+  qty/paid/segnali restano condivisi come sempre, solo il calcolo del peso
+  per settore viene fatto due volte, una per proprietario.
+- FCF, date earnings e target di consenso analisti **non sono dati live**:
+  Yahoo non li espone in modo affidabile e gratuito con gli endpoint usati
+  qui. `fcf_negative` e `catalyst_date` in `config.SCREENER_UNIVERSE` sono
+  flag statici che l'utente aggiorna a mano quando cambiano — meglio
+  onesto che finto "live" che in realtà non lo è. Lo sconto del 20% dal
+  target di consenso (parte della regola 6) non è verificabile per lo
+  stesso motivo: senza una data di catalizzatore, quei titoli restano
+  sempre WATCH anche se tutto il resto tornerebbe.
+- `SPCX` (SpaceX) nella lista "da evitare" potrebbe non essere un ticker
+  valido su nessun mercato pubblico (SpaceX non è quotata): è comunque
+  incluso come promemoria testuale — l'app non ha bisogno di prezzi live
+  per gli esclusi, li blocca solo per simbolo.
 - Telegram (`TELEGRAM_BOT_TOKEN` + chat ID) è sia canale push (`broadcast()`
   manda su mail e Telegram insieme, ognuno funziona anche da solo) sia bot
   interattivo: un thread in background fa long polling su `getUpdates`
