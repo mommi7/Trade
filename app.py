@@ -295,9 +295,12 @@ def api_settings_get():
 
 @app.route("/api/settings", methods=["POST"])
 def api_settings_set():
+    """Email facoltativa: Telegram è il canale principale (vedi gate
+    d'ingresso), la mail resta un extra opzionale. Un campo vuoto è valido
+    (significa "nessuna mail"), non un errore."""
     data = request.get_json(force=True)
     email = (data.get("email") or "").strip()
-    if not EMAIL_RE.match(email):
+    if email and not EMAIL_RE.match(email):
         return jsonify({"error": "Email non valida"}), 400
     set_alert_email(email)
     return jsonify({"ok": True, "email": email})
@@ -3123,7 +3126,11 @@ def api_history():
 # --------------------------------------------------------------------------
 @app.route("/")
 def index():
-    return render_template_string(INDEX_HTML, alert_email=get_alert_email() or "")
+    return render_template_string(
+        INDEX_HTML,
+        alert_email=get_alert_email() or "",
+        telegram_chat_id=get_telegram_chat_id() or "",
+    )
 
 
 INDEX_HTML = r"""
@@ -3347,9 +3354,11 @@ nav.bottom button.active { color: var(--blue); }
 <div id="email-gate" style="display:none">
   <div class="box">
     <h1>🎯 Cecchino Pro</h1>
-    <p>Inserisci la tua email: è l'indirizzo a cui arriveranno gli alert BUY/SELL.</p>
-    <input id="gate-email" type="email" placeholder="tuamail@esempio.com">
-    <button onclick="saveGateEmail()">Inizia</button>
+    <p>I segnali arrivano su Telegram, niente email. Se non l'hai già fatto: apri Telegram, cerca il tuo bot e scrivigli un messaggio qualsiasi (es. "ciao"), poi torna qui e premi il pulsante.</p>
+    <button onclick="detectAndStartTelegram()">📡 Ho scritto al bot — collega</button>
+    <p style="font-size:12px;margin-top:16px">Oppure inserisci il chat ID a mano:</p>
+    <input id="gate-telegram" type="text" placeholder="es. 123456789" autocomplete="off">
+    <button class="secondary" onclick="saveGateTelegram()">Collega</button>
     <div class="err" id="gate-err"></div>
   </div>
 </div>
@@ -3358,10 +3367,7 @@ nav.bottom button.active { color: var(--blue); }
   <div class="box">
     <span class="close-x" onclick="closeSettings()">✕</span>
     <h2>⚙️ Impostazioni</h2>
-    <div class="dim" style="font-size:12px">Canali per ricevere gli alert BUY/SELL</div>
-
-    <label>Email</label>
-    <input id="set-email" type="email" placeholder="tuamail@esempio.com">
+    <div class="dim" style="font-size:12px">Canale principale per gli alert BUY/SELL</div>
 
     <label>Telegram — chat ID</label>
     <input id="set-telegram" type="text" placeholder="es. 123456789">
@@ -3369,6 +3375,9 @@ nav.bottom button.active { color: var(--blue); }
       <button class="secondary" style="flex:1" onclick="detectTelegramChatId()">📡 Rileva automaticamente</button>
     </div>
     <div class="hint">Prima scrivi un messaggio qualsiasi al tuo bot su Telegram (es. "ciao"), poi premi "Rileva automaticamente" — trova da solo il tuo chat ID. Se il bot non è ancora configurato lato server, vedi il README per crearlo con @BotFather.</div>
+
+    <label>Email (opzionale, in più a Telegram)</label>
+    <input id="set-email" type="email" placeholder="lascia vuoto per non usarla">
 
     <div class="row-btns">
       <button style="flex:1" onclick="saveSettings()">Salva</button>
@@ -3549,35 +3558,57 @@ nav.bottom button.active { color: var(--blue); }
 
 <script>
 let CURRENT_EMAIL = {{ alert_email|tojson }};
+let CURRENT_TELEGRAM = {{ telegram_chat_id|tojson }};
 
 function refreshEmailUI() {
   const gate = document.getElementById('email-gate');
   const display = document.getElementById('email-display');
-  if (!CURRENT_EMAIL) {
+  if (!CURRENT_TELEGRAM) {
     gate.style.display = 'flex';
     display.textContent = '';
   } else {
     gate.style.display = 'none';
-    display.textContent = '✉️ ' + CURRENT_EMAIL;
+    display.textContent = '🔔 Telegram collegato' + (CURRENT_EMAIL ? ' + ✉️' : '');
   }
 }
 
-async function saveGateEmail() {
-  const email = document.getElementById('gate-email').value.trim();
+async function saveTelegramChatId(chatId) {
   const errEl = document.getElementById('gate-err');
-  errEl.textContent = '';
-  const res = await fetch('/api/settings', {
+  const res = await fetch('/api/settings/telegram', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({email}),
+    body: JSON.stringify({chat_id: chatId}),
   });
   const data = await res.json();
   if (!res.ok) {
     errEl.textContent = data.error || 'Errore';
     return;
   }
-  CURRENT_EMAIL = data.email;
+  CURRENT_TELEGRAM = data.telegram_chat_id;
   refreshEmailUI();
+}
+
+async function detectAndStartTelegram() {
+  const errEl = document.getElementById('gate-err');
+  errEl.textContent = '';
+  const res = await fetch('/api/settings/telegram/detect', { method: 'POST' });
+  const data = await res.json();
+  if (!res.ok) {
+    errEl.textContent = data.error || 'Errore';
+    return;
+  }
+  await saveTelegramChatId(data.telegram_chat_id);
+}
+
+async function saveGateTelegram() {
+  const chatId = document.getElementById('gate-telegram').value.trim();
+  const errEl = document.getElementById('gate-err');
+  errEl.textContent = '';
+  if (!chatId) {
+    errEl.textContent = 'Inserisci un chat ID, oppure scrivi al bot e premi "Ho scritto al bot"';
+    return;
+  }
+  await saveTelegramChatId(chatId);
 }
 
 async function openSettings() {

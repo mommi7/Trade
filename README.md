@@ -1,9 +1,9 @@
 # Cecchino Pro
 
-Sistema di trading signal monitoring. Alla prima apertura chiede solo
-**l'email a cui mandare gli alert** (niente login, niente account Google da
-configurare) — poi Scanner, Portafoglio, Alert e Storico. Calcola segnali
-basati su RSI, medie mobili e distanza dai massimi/minimi a 52 settimane.
+Sistema di trading signal monitoring. Alla prima apertura chiede solo di
+**collegare il bot Telegram** (niente login, niente email obbligatoria) —
+poi Scanner, Portafoglio, Alert e Storico. Calcola segnali basati su RSI,
+medie mobili e distanza dai massimi/minimi a 52 settimane.
 
 Puoi farlo girare in due modi:
 
@@ -13,16 +13,7 @@ Puoi farlo girare in due modi:
    Ha un limite importante: leggi la sezione "Limiti del free tier" prima
    di fidartene per soldi veri.
 
-## 1. Configura il mittente delle mail (obbligatorio in entrambi i casi)
-
-Genera una **password per le app** Gmail su
-`https://myaccount.google.com/apppasswords` (richiede la verifica in due
-passaggi attiva). Questo è l'account che **invia** le mail — il
-**destinatario** è l'email che inserisci direttamente nell'app al primo
-avvio (si può cambiare in qualsiasi momento dalle Impostazioni ⚙️ in alto
-a destra).
-
-## 1b. Bot Telegram — notifiche push E comandi interattivi
+## 1. Bot Telegram — canale principale, obbligatorio al primo avvio
 
 Il sito resta il "cervello" che gira in background (calcola i segnali,
 tiene lo stop loss, aggiorna il portafoglio ogni ora): il bot Telegram è
@@ -52,10 +43,19 @@ il sito ogni volta.
    gli hai dato e mandagli un messaggio qualsiasi (es. "ciao"). Il primo
    messaggio che riceve si registra da solo come proprietario — nessun
    altro può usarlo dopo, il bot ignora silenziosamente chiunque non sia
-   te. Ti risponde "✅ Configurato!" e da lì puoi mandare foto o comandi.
+   te. Ti risponde "✅ Configurato!".
+4. **Apri il sito**: la prima schermata chiede di collegare Telegram — se
+   hai già scritto al bot basta premere "📡 Ho scritto al bot — collega"
+   (trova da solo il tuo chat ID), altrimenti puoi incollarlo a mano. Da
+   quel momento tutti gli alert (BUY/SELL, stop loss, opportunità, verdetto
+   giornaliero, screener) arrivano lì — nessuna email richiesta.
 
-Puoi usare mail e Telegram insieme: ogni alert automatico va su entrambi
-i canali configurati.
+**L'email è facoltativa**, non più il canale principale: se la vuoi
+comunque come backup, impostala dalle Impostazioni ⚙️ (genera una
+password per le app Gmail su `https://myaccount.google.com/apppasswords`,
+richiede la verifica in due passaggi attiva, e imposta `CECCHINO_EMAIL_FROM`
+/ `CECCHINO_EMAIL_PASSWORD`) — se la lasci vuota, l'app funziona lo stesso
+solo con Telegram.
 
 **Un limite onesto sulla reattività**: sull'hosting cloud gratuito
 (Render) il bot risponde ai tuoi messaggi solo mentre il processo è
@@ -193,11 +193,11 @@ github.com → foto profilo in alto a destra → **Settings** →
 
 ## Funzionalità
 
-- **Email e/o Telegram per gli alert**: alla prima apertura l'app chiede
-  solo l'indirizzo a cui mandare i segnali BUY/SELL. Telegram si aggiunge
-  dalle Impostazioni ⚙️ in alto a destra (vedi sezione 1b) — più semplice
-  e istantaneo della mail, i due canali funzionano insieme se li
-  configuri entrambi.
+- **Telegram per gli alert (email opzionale)**: alla prima apertura l'app
+  chiede solo di collegare il bot Telegram (vedi sezione 1) — nessuna
+  email richiesta. Se vuoi anche la mail come backup, aggiungila dalle
+  Impostazioni ⚙️ in alto a destra: i due canali funzionano insieme se
+  configuri entrambi, ma Telegram basta da solo.
 - **Importa portafoglio da foto 📷**: nel tab Portafoglio, "Importa da
   foto" — scatta o carica uno screenshot del tuo broker (es. Trade
   Republic) e Gemini Vision legge titolo, valore e guadagno/perdita di
