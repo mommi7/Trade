@@ -129,6 +129,36 @@ def init_db():
             notified INTEGER DEFAULT 0,
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
         );
+
+        CREATE TABLE IF NOT EXISTS bottleneck_cache (
+            ticker TEXT PRIMARY KEY,
+            data_json TEXT,
+            fetched_at REAL
+        );
+
+        CREATE TABLE IF NOT EXISTS bottleneck_scan (
+            ticker TEXT PRIMARY KEY,
+            result_json TEXT,
+            scanned_at REAL
+        );
+
+        CREATE TABLE IF NOT EXISTS bottleneck_decisions (
+            id INTEGER PRIMARY KEY,
+            ticker TEXT,
+            verdict_a TEXT,
+            verdict_b TEXT,
+            engine_a_json TEXT,
+            engine_b_json TEXT,
+            thresholds_json TEXT,
+            price_at_decision REAL,
+            price_3m REAL,
+            price_6m REAL,
+            price_12m REAL,
+            checked_3m INTEGER DEFAULT 0,
+            checked_6m INTEGER DEFAULT 0,
+            checked_12m INTEGER DEFAULT 0,
+            created DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
         """
     )
     conn.commit()
@@ -493,6 +523,558 @@ def fetch_twelvedata(ticker):
 def fetch_market_data(ticker):
     """Yahoo come fonte primaria, poi Stooq, poi Twelve Data (se configurata)."""
     return fetch_yahoo(ticker) or fetch_stooq(ticker) or fetch_twelvedata(ticker)
+
+
+# --------------------------------------------------------------------------
+# Fondamentali per il Bottleneck Filter (Motore A + Motore B).
+# Endpoint non ufficiale di Yahoo (quoteSummary), stesso usato internamente
+# da yfinance: nessuna chiave richiesta, ma i moduli possono mancare per
+# molti titoli (specie fuori USA) — ogni campo può tornare None, e questo è
+# gestito a valle come "dato non disponibile", mai come bocciatura.
+def fetch_yahoo_fundamentals(ticker):
+    _warm_yahoo_session()
+    modules = (
+        "defaultKeyStatistics,financialData,summaryDetail,price,"
+        "incomeStatementHistoryQuarterly,cashflowStatementHistoryQuarterly,"
+        "recommendationTrend,calendarEvents"
+    )
+    data = None
+    for base in ["query1", "query2"]:
+        try:
+            url = f"https://{base}.finance.yahoo.com/v10/finance/quoteSummary/{ticker}"
+            r = YAHOO_SESSION.get(url, params={"modules": modules}, timeout=12)
+            if r.status_code != 200:
+                continue
+            result = r.json()["quoteSummary"]["result"]
+            if not result:
+                continue
+            data = result[0]
+            break
+        except Exception as e:
+            print(f"Yahoo fundamentals {base} fallito per {ticker}: {e}")
+    if data is None:
+        return None
+
+    def raw(mod, field):
+        v = (data.get(mod) or {}).get(field)
+        if isinstance(v, dict):
+            return v.get("raw")
+        return v
+
+    out = {
+        "pe": raw("summaryDetail", "trailingPE") or raw("defaultKeyStatistics", "trailingPE"),
+        "market_cap": raw("price", "marketCap"),
+        "fifty_two_week_high": raw("summaryDetail", "fiftyTwoWeekHigh"),
+        "fcf_ttm": raw("financialData", "freeCashflow"),
+        "ebitda_ttm": raw("financialData", "ebitda"),
+        "total_debt": raw("financialData", "totalDebt"),
+        "total_cash": raw("financialData", "totalCash"),
+        "analyst_coverage": raw("financialData", "numberOfAnalystOpinions"),
+        "recommendation_key": raw("financialData", "recommendationKey"),
+        "gross_margin_pct": None,
+        "operating_margin_pct": raw("financialData", "operatingMargins"),
+        "revenue_growth_yoy_pct": raw("financialData", "revenueGrowth"),
+    }
+    if out["operating_margin_pct"] is not None:
+        out["operating_margin_pct"] *= 100
+    if out["revenue_growth_yoy_pct"] is not None:
+        out["revenue_growth_yoy_pct"] *= 100
+    gm = raw("financialData", "grossMargins")
+    if gm is not None:
+        out["gross_margin_pct"] = gm * 100
+
+    # Ricavi/EBITDA trimestrali (fino a 4 trimestri) per la dislocazione e
+    # per R&D/capex — non tutti i titoli espongono questo modulo.
+    q_income = (data.get("incomeStatementHistoryQuarterly") or {}).get("incomeStatementHistory") or []
+    quarters = []
+    for q in q_income[:4]:
+        quarters.append({
+            "revenue": (q.get("totalRevenue") or {}).get("raw"),
+            "ebit": (q.get("ebit") or {}).get("raw"),
+            "rnd": (q.get("researchDevelopment") or {}).get("raw"),
+        })
+    out["quarters"] = quarters
+
+    q_cash = (data.get("cashflowStatementHistoryQuarterly") or {}).get("cashflowStatements") or []
+    capex_values = [
+        (q.get("capitalExpenditures") or {}).get("raw")
+        for q in q_cash[:4]
+        if (q.get("capitalExpenditures") or {}).get("raw") is not None
+    ]
+    out["capex_ttm"] = sum(capex_values) if capex_values else None
+
+    # Prossimo earnings (per il catalizzatore, regola 8)
+    earnings_dates = ((data.get("calendarEvents") or {}).get("earnings") or {}).get("earningsDate") or []
+    out["next_earnings_date"] = None
+    if earnings_dates:
+        ts = earnings_dates[0].get("raw") if isinstance(earnings_dates[0], dict) else None
+        if ts:
+            out["next_earnings_date"] = datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d")
+
+    return out
+
+
+def fetch_yahoo_history(ticker, rng="3y"):
+    """Serie storica settimanale (leggera) per massimo 52w e rendimento a 3
+    anni del Bottleneck Filter. Fonte singola Yahoo: se fallisce, i filtri
+    che ne dipendono risultano "dato non disponibile", non "bocciati"."""
+    _warm_yahoo_session()
+    for base in ["query1", "query2"]:
+        try:
+            url = f"https://{base}.finance.yahoo.com/v8/finance/chart/{ticker}"
+            r = YAHOO_SESSION.get(url, params={"interval": "1wk", "range": rng}, timeout=12)
+            if r.status_code != 200:
+                continue
+            result = r.json()["chart"]["result"][0]
+            quote = result["indicators"]["quote"][0]
+            closes = [c for c in quote.get("close", []) if c]
+            if len(closes) >= 2:
+                return closes
+        except Exception as e:
+            print(f"Yahoo history fallita per {ticker}: {e}")
+    return None
+
+
+_BOTTLENECK_MEM_CACHE = {}
+
+
+def get_fundamentals_cached(ticker):
+    """Cache 24h su DB (persiste tra riavvii/redeploy) + memoria di processo."""
+    now = time.time()
+    mem = _BOTTLENECK_MEM_CACHE.get(ticker)
+    if mem and now - mem["at"] < config.BOTTLENECK_CACHE_TTL_SECONDS:
+        return mem["data"]
+
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT data_json, fetched_at FROM bottleneck_cache WHERE ticker = ?", (ticker,)
+        ).fetchone()
+        if row and now - row["fetched_at"] < config.BOTTLENECK_CACHE_TTL_SECONDS:
+            fund = json.loads(row["data_json"])
+            _BOTTLENECK_MEM_CACHE[ticker] = {"data": fund, "at": row["fetched_at"]}
+            return fund
+
+        fund = fetch_yahoo_fundamentals(ticker)
+        market = fetch_market_data(ticker)
+        history_3y = fetch_yahoo_history(ticker, "3y")
+        high_52w = None
+        return_3y_pct = None
+        if history_3y:
+            high_52w = max(history_3y[-52:]) if len(history_3y) >= 2 else None
+            if history_3y[0]:
+                return_3y_pct = (history_3y[-1] - history_3y[0]) / history_3y[0] * 100
+        if fund and fund.get("fifty_two_week_high"):
+            high_52w = fund["fifty_two_week_high"]  # dato Yahoo diretto, preferito se disponibile
+        combined = {
+            "fundamentals": fund,
+            "market": market,
+            "high_52w": high_52w,
+            "return_3y_pct": return_3y_pct,
+        }
+        conn.execute(
+            "INSERT INTO bottleneck_cache (ticker, data_json, fetched_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(ticker) DO UPDATE SET data_json = excluded.data_json, fetched_at = excluded.fetched_at",
+            (ticker, json.dumps(combined), now),
+        )
+        conn.commit()
+        _BOTTLENECK_MEM_CACHE[ticker] = {"data": combined, "at": now}
+        return combined
+    finally:
+        conn.close()
+
+
+def _mk_filter(key, label, value, threshold, cmp, unit=""):
+    """Costruisce il risultato di un filtro di Motore A. Se il valore è
+    assente, lo stato è "missing" — mai "fail": un dato non disponibile
+    non è una bocciatura (vedi prompt Bottleneck Filter)."""
+    if value is None:
+        status = "missing"
+    elif cmp == "gte":
+        status = "pass" if value >= threshold else "fail"
+    elif cmp == "lte":
+        status = "pass" if value <= threshold else "fail"
+    else:  # "gt"
+        status = "pass" if value > threshold else "fail"
+    return {"key": key, "label": label, "status": status, "value": value, "threshold": threshold, "unit": unit}
+
+
+def _score_from_bands(value, bands, default=0):
+    """bands: lista di (soglia, punteggio) ordinata decrescente. Ritorna il
+    punteggio della prima soglia raggiunta, None se value è None."""
+    if value is None:
+        return None
+    for threshold, score in bands:
+        if value >= threshold:
+            return score
+    return default
+
+
+def _quarterly_ebit_yoy(quarters):
+    """Variazione % dell'EBIT (proxy di EBITDA trimestrale, Yahoo non espone
+    EBITDA per trimestro gratis) tra il trimestre più recente e quello di
+    4 trimestri fa — approssima il confronto anno su anno."""
+    if not quarters or len(quarters) < 4:
+        return None
+    recent, year_ago = quarters[0].get("ebit"), quarters[3].get("ebit")
+    if recent is None or year_ago is None or year_ago == 0:
+        return None
+    return (recent - year_ago) / abs(year_ago) * 100
+
+
+def compute_dislocation(drawdown_pct, revenue_yoy_pct, ebitda_yoy_pct):
+    """Regola 4 (il filtro centrale): calo prezzo / calo peggiore tra ricavi
+    ed EBITDA sugli ultimi 4 trimestri. Se i fondamentali crescono mentre il
+    prezzo scende, punteggio massimo (99 = valore alto convenzionale per
+    l'ordinamento, non infinito per restare serializzabile in JSON)."""
+    if drawdown_pct is None or revenue_yoy_pct is None or ebitda_yoy_pct is None:
+        return None
+    worst = min(revenue_yoy_pct, ebitda_yoy_pct)
+    if worst >= 0:
+        return 99.0 if drawdown_pct > 0 else 0.0
+    if drawdown_pct <= 0:
+        return 0.0
+    return drawdown_pct / abs(worst)
+
+
+def _combine_engine_a_status(filters):
+    statuses = [f["status"] for f in filters]
+    fails = statuses.count("fail")
+    if fails >= 2:
+        return "ESCLUSO"
+    if fails == 1:
+        return "A_UN_FILTRO"
+    if "missing" in statuses:
+        return "DATI_INCOMPLETI"
+    return "IDONEO"
+
+
+def compute_engine_a(combined, thresholds):
+    """Motore A: gli 8 filtri quantitativi che giudicano l'azienda. Mai
+    mescolato col Motore B nel verdetto finale."""
+    t = thresholds
+    fund = combined.get("fundamentals") or {}
+    market = combined.get("market") or {}
+    price = market.get("price")
+    high_52w = combined.get("high_52w")
+
+    drawdown_pct = (high_52w - price) / high_52w * 100 if price and high_52w else None
+    return_3y_pct = combined.get("return_3y_pct")
+    pe = fund.get("pe")
+    revenue_yoy = fund.get("revenue_growth_yoy_pct")
+    ebitda_yoy = _quarterly_ebit_yoy(fund.get("quarters"))
+    dislocation = compute_dislocation(drawdown_pct, revenue_yoy, ebitda_yoy)
+    fcf = fund.get("fcf_ttm")
+
+    net_debt_ebitda = None
+    total_debt, total_cash, ebitda = fund.get("total_debt"), fund.get("total_cash"), fund.get("ebitda_ttm")
+    if total_debt is not None and total_cash is not None and ebitda:
+        net_debt_ebitda = (total_debt - total_cash) / ebitda
+
+    coverage, rec = fund.get("analyst_coverage"), fund.get("recommendation_key")
+    coverage_status = "missing"
+    if coverage is not None:
+        coverage_ok = coverage >= t["min_analyst_coverage"] and rec not in ("sell", "strong_sell")
+        coverage_status = "pass" if coverage_ok else "fail"
+
+    next_earnings = fund.get("next_earnings_date")
+    catalyst_status = "missing"
+    if next_earnings:
+        try:
+            days_to = (datetime.strptime(next_earnings, "%Y-%m-%d").date() - datetime.now().date()).days
+            catalyst_status = "pass" if 0 <= days_to <= t["catalyst_window_days"] else "fail"
+        except ValueError:
+            pass
+
+    filters = [
+        _mk_filter("drawdown", "Drawdown da massimo 52 settimane", drawdown_pct, t["drawdown_min_pct"], "gte", "%"),
+        _mk_filter("return_3y", "Rendimento 3 anni (tetto)", return_3y_pct, t["return_3y_max_pct"], "lte", "%"),
+        _mk_filter("pe", "P/E (tetto)", pe, t["pe_max"], "lte", "x"),
+        _mk_filter("dislocation", "Dislocazione prezzo/fondamentali", dislocation, t["dislocation_min"], "gte", "x"),
+        _mk_filter("fcf", "Free cash flow TTM positivo", fcf, 0, "gt", "€"),
+        _mk_filter("net_debt_ebitda", "Debito netto / EBITDA", net_debt_ebitda, t["net_debt_ebitda_max"], "lte", "x"),
+        {"key": "analyst_coverage", "label": "Copertura analisti + consenso non Sell", "status": coverage_status,
+         "value": f"{coverage} analisti, consenso {rec}" if coverage is not None else None,
+         "threshold": f">= {t['min_analyst_coverage']} analisti, non Sell", "unit": ""},
+        {"key": "catalyst", "label": "Catalizzatore (prossimi earnings) entro 3 mesi", "status": catalyst_status,
+         "value": next_earnings, "threshold": f"entro {t['catalyst_window_days']} giorni", "unit": ""},
+    ]
+    return {"filters": filters, "status": _combine_engine_a_status(filters), "dislocation_value": dislocation}
+
+
+def compute_engine_b(combined, thresholds):
+    """Motore B: Bottleneck Filter personale, 5 sotto-punteggi 0-10.
+    Nota metodologica onesta: "quota di mercato" e "massimo storico" non
+    sono disponibili gratis in modo affidabile — bottleneckPurity usa solo
+    il gross margin, hypeFactor usa il massimo delle ultime 52 settimane
+    come proxy del massimo storico (non il vero all-time high)."""
+    fund = combined.get("fundamentals") or {}
+    market = combined.get("market") or {}
+    price = market.get("price")
+    high_52w = combined.get("high_52w")
+
+    gm = fund.get("gross_margin_pct")
+    om = fund.get("operating_margin_pct")
+    quarters = fund.get("quarters") or []
+    growth_pct = fund.get("revenue_growth_yoy_pct")
+
+    rnd_pct = None
+    if quarters and quarters[0].get("rnd") is not None and quarters[0].get("revenue"):
+        rnd_pct = quarters[0]["rnd"] / quarters[0]["revenue"] * 100
+    capex_pct = None
+    capex_ttm = fund.get("capex_ttm")
+    revenue_ttm = sum(q["revenue"] for q in quarters if q.get("revenue") is not None) or None
+    if capex_ttm is not None and revenue_ttm:
+        capex_pct = abs(capex_ttm) / revenue_ttm * 100
+
+    margin_bands = [(70, 10), (60, 8), (50, 6), (40, 4), (30, 2)]
+    supply_parts = [p for p in [
+        _score_from_bands(rnd_pct, [(20, 10), (15, 8), (10, 6), (5, 4), (2, 2)]),
+        _score_from_bands(capex_pct, [(15, 10), (10, 8), (7, 6), (4, 4), (2, 2)]),
+    ] if p is not None]
+    moat_parts = [p for p in [
+        _score_from_bands(gm, margin_bands),
+        _score_from_bands(om, [(30, 10), (25, 8), (20, 6), (15, 4), (10, 2)]),
+    ] if p is not None]
+
+    hype = None
+    if price and high_52w:
+        distance_pct = max(0.0, (high_52w - price) / high_52w * 100)
+        hype = round(max(0.0, 10 - min(distance_pct, 100) / 10), 1)
+
+    scores = {
+        "bottleneckPurity": _score_from_bands(gm, margin_bands),
+        "supplyConstraint": round(sum(supply_parts) / len(supply_parts), 1) if supply_parts else None,
+        "growthDocumented": (round(max(0, min(10, growth_pct / thresholds["growth_min_pct"] * 10)), 1)
+                              if growth_pct is not None else None),
+        "moatStrength": round(sum(moat_parts) / len(moat_parts), 1) if moat_parts else None,
+        "hypeFactor": hype,
+    }
+
+    missing = [k for k, v in scores.items() if v is None]
+    if missing:
+        return {"scores": scores, "total": None, "verdict": "DATI_INCOMPLETI", "missing": missing}
+
+    total = round(sum(scores.values()), 1)
+    if total >= thresholds["buy_score_min"] and scores["hypeFactor"] <= thresholds["hype_max"] \
+            and (growth_pct or 0) >= thresholds["growth_min_pct"]:
+        verdict = "COMPRA"
+    elif total >= thresholds["watch_score_min"]:
+        verdict = "ATTENDI"
+    else:
+        verdict = "PASSA"
+    return {"scores": scores, "total": total, "verdict": verdict, "missing": []}
+
+
+def compute_portfolio_constraints(ticker, sector, thresholds, owner=None):
+    """Livello 3, sempre applicato DOPO i due motori e mai mescolato con
+    essi: un titolo può essere idoneo sui dati e comunque sbagliato per il
+    portafoglio corrente (troppo concentrato su quel titolo/settore, o
+    scende sotto la soglia minima di difensivi)."""
+    conn = get_db()
+    try:
+        if owner:
+            rows = conn.execute(
+                "SELECT * FROM tickers WHERE active = 1 AND qty > 0 AND (owner = ? OR owner = 'shared')",
+                (owner,),
+            ).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM tickers WHERE active = 1 AND qty > 0").fetchall()
+    finally:
+        conn.close()
+
+    total = sector_value = defensive_value = ticker_value = 0.0
+    for row in rows:
+        with CACHE_LOCK:
+            cached = LAST_ANALYSIS.get(row["ticker"])
+        price = cached["price"] if cached and "error" not in cached else row["paid"]
+        value = (price or 0) * (row["qty"] or 0)
+        total += value
+        r_sector = SCREENER_BY_TICKER.get(row["ticker"], {}).get("sector")
+        if r_sector == sector:
+            sector_value += value
+        if r_sector in config.DEFENSIVE_SECTORS:
+            defensive_value += value
+        if row["ticker"] == ticker:
+            ticker_value += value
+
+    if total <= 0:
+        return {"checks": [{"key": "portfolio_empty", "label": "Portafoglio vuoto o senza posizioni valorizzate",
+                             "status": "missing", "value": None, "threshold": None}],
+                "blocked": False, "blocked_by": []}
+
+    checks = [{
+        "key": "max_pct_per_stock", "label": "Max % per titolo",
+        "status": "pass" if ticker_value / total * 100 <= thresholds["max_pct_per_stock"] else "fail",
+        "value": round(ticker_value / total * 100, 1), "threshold": thresholds["max_pct_per_stock"],
+    }]
+    if sector:
+        sector_pct = sector_value / total * 100
+        checks.append({
+            "key": "max_pct_per_sector", "label": f"Max % settore ({sector})",
+            "status": "pass" if sector_pct <= thresholds["max_pct_per_sector"] else "fail",
+            "value": round(sector_pct, 1), "threshold": thresholds["max_pct_per_sector"],
+        })
+    defensive_pct = defensive_value / total * 100
+    checks.append({
+        "key": "min_pct_defensive", "label": "Min % difensivi",
+        "status": "pass" if defensive_pct >= thresholds["min_pct_defensive"] else "fail",
+        "value": round(defensive_pct, 1), "threshold": thresholds["min_pct_defensive"],
+    })
+    blocked_by = [c["key"] for c in checks if c["status"] == "fail"]
+    return {"checks": checks, "blocked": bool(blocked_by), "blocked_by": blocked_by}
+
+
+def analyze_bottleneck(ticker, thresholds=None, owner=None):
+    """Esegue entrambi i motori + il livello di portafoglio per un ticker,
+    con le soglie correnti (default se non passate). Ritorna la struttura
+    completa mostrata dalla card UI."""
+    th = thresholds or config.BOTTLENECK_DEFAULTS
+    combined = get_fundamentals_cached(ticker)
+    if not combined or not (combined.get("market") or {}).get("price"):
+        return {"ticker": ticker, "error": "Dati non disponibili per questo ticker"}
+
+    spec = SCREENER_BY_TICKER.get(ticker, {})
+    engine_a = compute_engine_a(combined, th["engine_a"])
+    engine_b = compute_engine_b(combined, th["engine_b"])
+    portfolio = compute_portfolio_constraints(ticker, spec.get("sector"), th["portfolio"], owner=owner)
+
+    return {
+        "ticker": ticker,
+        "name": (combined.get("market") or {}).get("name", ticker),
+        "price": (combined.get("market") or {}).get("price"),
+        "sector": spec.get("sector"),
+        "engine_a": engine_a,
+        "engine_b": engine_b,
+        "portfolio": portfolio,
+        "blocked_by_level": (
+            "motore_a" if engine_a["status"] == "ESCLUSO" else
+            "motore_b" if engine_b["verdict"] == "PASSA" else
+            "portafoglio" if portfolio["blocked"] else
+            None
+        ),
+    }
+
+
+def save_bottleneck_decision(result, thresholds):
+    """Registro delle decisioni: salva il verdetto corrente per poter
+    ricalcolare in futuro se aveva ragione (pagina /accuratezza)."""
+    if result.get("error"):
+        return
+    conn = get_db()
+    try:
+        conn.execute(
+            "INSERT INTO bottleneck_decisions "
+            "(ticker, verdict_a, verdict_b, engine_a_json, engine_b_json, thresholds_json, price_at_decision) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                result["ticker"], result["engine_a"]["status"], result["engine_b"]["verdict"],
+                json.dumps(result["engine_a"]), json.dumps(result["engine_b"]),
+                json.dumps(thresholds), result["price"],
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def recheck_bottleneck_decisions():
+    """Job periodico (chiamato dal monitor e da /api/cron/tick): per ogni
+    decisione salvata che ha superato 3/6/12 mesi e non è stata ancora
+    ricontrollata a quella scadenza, registra il prezzo attuale. Alimenta
+    /accuratezza — quali filtri escludono titoli che poi salgono davvero."""
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM bottleneck_decisions WHERE checked_3m = 0 OR checked_6m = 0 OR checked_12m = 0"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    now = datetime.now()
+    for row in rows:
+        try:
+            created = datetime.strptime(row["created"].split(".")[0], "%Y-%m-%d %H:%M:%S")
+        except (ValueError, AttributeError):
+            continue
+        age_days = (now - created).days
+        updates = {}
+        if age_days >= 90 and not row["checked_3m"]:
+            updates["price_3m"], updates["checked_3m"] = _bottleneck_price_now(row["ticker"]), 1
+        if age_days >= 180 and not row["checked_6m"]:
+            updates["price_6m"], updates["checked_6m"] = _bottleneck_price_now(row["ticker"]), 1
+        if age_days >= 365 and not row["checked_12m"]:
+            updates["price_12m"], updates["checked_12m"] = _bottleneck_price_now(row["ticker"]), 1
+        if not updates:
+            continue
+        conn = get_db()
+        try:
+            set_clause = ", ".join(f"{k} = ?" for k in updates)
+            conn.execute(f"UPDATE bottleneck_decisions SET {set_clause} WHERE id = ?",
+                         (*updates.values(), row["id"]))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def _bottleneck_price_now(ticker):
+    data = fetch_market_data(ticker)
+    return data["price"] if data else None
+
+
+def compute_bottleneck_accuracy():
+    """Per ogni filtro di Motore A e per il verdetto di Motore B, tra le
+    decisioni ricontrollate: quante volte ha escluso un titolo poi salito e
+    quante volte uno poi sceso. Serve a capire quali filtri discriminano
+    davvero (vedi pagina /accuratezza)."""
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM bottleneck_decisions WHERE checked_3m = 1 OR checked_6m = 1 OR checked_12m = 1"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    per_filter = {}  # filter_key -> {"escluso_salito": n, "escluso_sceso": n}
+
+    def bump(key, went_up):
+        stat = per_filter.setdefault(key, {"escluso_salito": 0, "escluso_sceso": 0})
+        stat["escluso_salito" if went_up else "escluso_sceso"] += 1
+
+    for row in rows:
+        for horizon in ("3m", "6m", "12m"):
+            if not row[f"checked_{horizon}"] or row[f"price_{horizon}"] is None or not row["price_at_decision"]:
+                continue
+            went_up = row[f"price_{horizon}"] > row["price_at_decision"]
+            try:
+                engine_a = json.loads(row["engine_a_json"])
+            except (TypeError, ValueError):
+                engine_a = {"filters": []}
+            for f in engine_a.get("filters", []):
+                if f["status"] == "fail":
+                    bump(f["key"], went_up)
+            if row["verdict_b"] == "PASSA":
+                bump("motore_b_passa", went_up)
+
+    out = []
+    for key, stat in per_filter.items():
+        n = stat["escluso_salito"] + stat["escluso_sceso"]
+        out.append({
+            "filter": key, "n": n,
+            "escluso_salito": stat["escluso_salito"], "escluso_sceso": stat["escluso_sceso"],
+            "pct_salito_dopo_esclusione": round(stat["escluso_salito"] / n * 100, 1) if n else None,
+        })
+    out.sort(key=lambda x: x["n"], reverse=True)
+
+    suggestions = []
+    for stat in out:
+        if stat["n"] >= 5 and stat["pct_salito_dopo_esclusione"] and stat["pct_salito_dopo_esclusione"] >= 60:
+            suggestions.append(
+                f"Il filtro \"{stat['filter']}\" ha escluso titoli poi saliti nel "
+                f"{stat['pct_salito_dopo_esclusione']}% dei casi ({stat['n']} osservazioni): "
+                f"valuta di allentarne la soglia."
+            )
+    return {"per_filter": out, "suggestions": suggestions}
 
 
 # --------------------------------------------------------------------------
@@ -1853,6 +2435,7 @@ def monitor_loop():
             run_market_screener()
             generate_daily_verdict()
             maybe_run_weekly_screener()
+            recheck_bottleneck_decisions()
         except Exception as e:
             print(f"Errore monitor (riprova in 5 min): {e}")
             time.sleep(300)
@@ -2042,7 +2625,129 @@ def api_cron_tick():
     run_market_screener()
     generate_daily_verdict()
     maybe_run_weekly_screener()
+    recheck_bottleneck_decisions()
     return jsonify({"ok": True})
+
+
+# --------------------------------------------------------------------------
+# API - Bottleneck Filter (screener a due motori, dati live)
+# --------------------------------------------------------------------------
+_BOTTLENECK_SCAN_STATE = {"running": False, "done": 0, "total": 0, "started_at": None, "finished_at": None}
+_BOTTLENECK_SCAN_LOCK = threading.Lock()
+
+
+def save_bottleneck_decision_daily(result, thresholds):
+    """Come save_bottleneck_decision, ma al massimo una voce per ticker al
+    giorno: evita che una scansione dell'intero universo, ripetuta più
+    volte, gonfi il registro con doppioni inutili all'accuratezza."""
+    if result.get("error"):
+        return
+    today = datetime.now().strftime("%Y-%m-%d")
+    conn = get_db()
+    try:
+        existing = conn.execute(
+            "SELECT id FROM bottleneck_decisions WHERE ticker = ? AND date(created) = ?",
+            (result["ticker"], today),
+        ).fetchone()
+    finally:
+        conn.close()
+    if not existing:
+        save_bottleneck_decision(result, thresholds)
+
+
+def _run_bottleneck_scan(thresholds):
+    universe = config.BOTTLENECK_UNIVERSE
+    with _BOTTLENECK_SCAN_LOCK:
+        _BOTTLENECK_SCAN_STATE.update({"running": True, "done": 0, "total": len(universe),
+                                        "started_at": datetime.now().isoformat(), "finished_at": None})
+    for ticker in universe:
+        try:
+            result = analyze_bottleneck(ticker, thresholds=thresholds)
+            if not result.get("error"):
+                conn = get_db()
+                try:
+                    conn.execute(
+                        "INSERT INTO bottleneck_scan (ticker, result_json, scanned_at) VALUES (?, ?, ?) "
+                        "ON CONFLICT(ticker) DO UPDATE SET result_json = excluded.result_json, "
+                        "scanned_at = excluded.scanned_at",
+                        (ticker, json.dumps(result), time.time()),
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+                save_bottleneck_decision_daily(result, thresholds)
+        except Exception as e:
+            print(f"Scan Bottleneck fallita per {ticker}: {e}")
+        with _BOTTLENECK_SCAN_LOCK:
+            _BOTTLENECK_SCAN_STATE["done"] += 1
+    with _BOTTLENECK_SCAN_LOCK:
+        _BOTTLENECK_SCAN_STATE["running"] = False
+        _BOTTLENECK_SCAN_STATE["finished_at"] = datetime.now().isoformat()
+
+
+@app.route("/api/bottleneck/thresholds", methods=["GET"])
+def api_bottleneck_thresholds():
+    return jsonify(config.BOTTLENECK_DEFAULTS)
+
+
+@app.route("/api/bottleneck/analyze/<ticker>", methods=["POST"])
+def api_bottleneck_analyze(ticker):
+    """Analisi live di un singolo ticker (ricerca manuale). Salva sempre nel
+    registro delle decisioni con le soglie correnti passate dal client."""
+    body = request.get_json(silent=True) or {}
+    thresholds = body.get("thresholds") or config.BOTTLENECK_DEFAULTS
+    owner = body.get("owner")
+    save = body.get("save", True)
+    result = analyze_bottleneck(ticker.upper().strip(), thresholds=thresholds, owner=owner)
+    if save and not result.get("error"):
+        save_bottleneck_decision(result, thresholds)
+    return jsonify(result)
+
+
+@app.route("/api/bottleneck/scan", methods=["POST"])
+def api_bottleneck_scan_start():
+    if _BOTTLENECK_SCAN_STATE["running"]:
+        return jsonify({"error": "Scansione già in corso", "state": _BOTTLENECK_SCAN_STATE}), 409
+    body = request.get_json(silent=True) or {}
+    thresholds = body.get("thresholds") or config.BOTTLENECK_DEFAULTS
+    threading.Thread(target=_run_bottleneck_scan, args=(thresholds,), daemon=True).start()
+    return jsonify({"started": True, "total": len(config.BOTTLENECK_UNIVERSE)})
+
+
+@app.route("/api/bottleneck/scan/status", methods=["GET"])
+def api_bottleneck_scan_status():
+    return jsonify(_BOTTLENECK_SCAN_STATE)
+
+
+@app.route("/api/bottleneck/scan/results", methods=["GET"])
+def api_bottleneck_scan_results():
+    only_idonei = request.args.get("only_idonei", "1") != "0"
+    conn = get_db()
+    try:
+        rows = conn.execute("SELECT ticker, result_json, scanned_at FROM bottleneck_scan").fetchall()
+    finally:
+        conn.close()
+    results = []
+    for row in rows:
+        try:
+            r = json.loads(row["result_json"])
+        except (TypeError, ValueError):
+            continue
+        r["scanned_at"] = row["scanned_at"]
+        results.append(r)
+    if only_idonei:
+        results = [
+            r for r in results
+            if r.get("engine_a", {}).get("status") in ("IDONEO", "A_UN_FILTRO")
+            and r.get("engine_b", {}).get("verdict") == "COMPRA"
+        ]
+    results.sort(key=lambda r: (r.get("engine_a", {}).get("dislocation_value") or 0), reverse=True)
+    return jsonify({"results": results, "total_scanned": len(rows)})
+
+
+@app.route("/api/accuratezza", methods=["GET"])
+def api_accuratezza():
+    return jsonify(compute_bottleneck_accuracy())
 
 
 # --------------------------------------------------------------------------
@@ -2550,10 +3255,10 @@ nav.bottom button {
   background: transparent;
   border-radius: 0;
   color: var(--dim);
-  padding: 10px 2px;
-  font-size: 10px;
+  padding: 8px 1px;
+  font-size: 9px;
   font-weight: 600;
-  line-height: 1.3;
+  line-height: 1.25;
 }
 nav.bottom button.active { color: var(--blue); }
 
@@ -2798,6 +3503,37 @@ nav.bottom button.active { color: var(--blue); }
     <div id="screener25-buy"></div>
     <div id="screener25-list"></div>
   </div>
+
+  <!-- BOTTLENECK FILTER (screener a due motori, dati live, universo multi-borsa) -->
+  <div class="tab-view" id="tab-bottleneck">
+    <div class="card">
+      <div class="dim" style="font-size:12px">
+        🎯 Due motori separati: <b>Motore A</b> (8 filtri quantitativi che giudicano l'azienda) e
+        <b>Motore B</b> (Bottleneck Filter personale, 0-10 per criterio). I vincoli di portafoglio
+        sono un terzo livello, applicato dopo e mostrato a parte. Screener informativo, criteri
+        uniformi su dati pubblici, nessuna raccomandazione personalizzata.
+      </div>
+    </div>
+    <div class="card">
+      <div class="row">
+        <div class="ticker-field" style="flex:1">
+          <input id="bn-input" placeholder="Ticker o nome (es. ASML, Micron)" style="width:100%" autocapitalize="characters" autocomplete="off">
+          <div class="suggest-box" id="bn-suggest"></div>
+        </div>
+        <button onclick="analyzeBottleneckTicker()">Analizza</button>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <button class="secondary" onclick="toggleBottleneckSliders()" style="flex:1">⚙️ Soglie</button>
+        <button class="secondary" onclick="startBottleneckScan()" style="flex:1">🔍 Scansiona universo</button>
+        <button class="secondary" onclick="toggleBottleneckAccuracy()" style="flex:1">📊 Accuratezza</button>
+      </div>
+    </div>
+    <div id="bn-sliders" style="display:none"></div>
+    <div id="bn-scan-status" class="dim" style="font-size:12px;margin-bottom:8px"></div>
+    <div id="bn-accuracy" style="display:none"></div>
+    <div id="bn-result"></div>
+    <div id="bn-scan-results"></div>
+  </div>
 </div>
 
 <nav class="bottom">
@@ -2805,6 +3541,7 @@ nav.bottom button.active { color: var(--blue); }
   <button id="nav-portfolio" onclick="showTab('portfolio')">💼 Portafoglio</button>
   <button id="nav-watchlist" onclick="showTab('watchlist')">🎯 Livelli</button>
   <button id="nav-screener25" onclick="showTab('screener25')">📅 Settimanale</button>
+  <button id="nav-bottleneck" onclick="showTab('bottleneck')">🎯 Bottleneck</button>
   <button id="nav-opportunities" onclick="showTab('opportunities')">💡 Opportunità</button>
   <button id="nav-alerts" onclick="showTab('alerts')">🔔 Alert</button>
   <button id="nav-history" onclick="showTab('history')">📜 Storico</button>
@@ -3011,6 +3748,7 @@ function attachTickerSuggest(inputId, boxId, onPick) {
 attachTickerSuggest('scan-input', 'scan-suggest');
 attachTickerSuggest('pf-ticker', 'pf-suggest');
 attachTickerSuggest('al-ticker', 'al-suggest');
+attachTickerSuggest('bn-input', 'bn-suggest', (it) => analyzeBottleneckTicker());
 
 function showTab(name) {
   document.querySelectorAll('.tab-view').forEach(el => el.classList.remove('active'));
@@ -3023,6 +3761,7 @@ function showTab(name) {
   if (name === 'opportunities') loadOpportunities();
   if (name === 'watchlist') { loadWatchlist(); loadWatchlistLog(); }
   if (name === 'screener25') loadScreener25();
+  if (name === 'bottleneck') initBottleneck();
 }
 
 function renderAnalysisCard(a, extraButtons) {
@@ -3386,6 +4125,219 @@ function renderScreener25(data) {
         </div>`).join('');
   }
   document.getElementById('screener25-list').innerHTML = html || '<div class="dim">Nessun dato ancora calcolato.</div>';
+}
+
+// --------------------------------------------------------------------------
+// Bottleneck Filter — screener a due motori
+// --------------------------------------------------------------------------
+let BN_THRESHOLDS = null;
+let BN_LAST_TICKER = null;
+let BN_SCAN_TIMER = null;
+
+async function initBottleneck() {
+  if (!BN_THRESHOLDS) {
+    const res = await fetch('/api/bottleneck/thresholds');
+    BN_THRESHOLDS = await res.json();
+    renderBottleneckSliders();
+  }
+  pollBottleneckScanStatus();
+}
+
+const BN_LABELS = {
+  drawdown_min_pct: 'Drawdown minimo da max 52w (%)',
+  return_3y_max_pct: 'Tetto rendimento 3 anni (%)',
+  pe_max: 'P/E massimo',
+  dislocation_min: 'Dislocazione minima (x)',
+  net_debt_ebitda_max: 'Debito netto/EBITDA massimo',
+  min_analyst_coverage: 'Copertura analisti minima',
+  catalyst_window_days: 'Finestra catalizzatore (giorni)',
+  buy_score_min: 'Punteggio minimo COMPRA (Motore B)',
+  hype_max: 'Hype massimo (Motore B)',
+  growth_min_pct: 'Crescita ricavi minima (%)',
+  watch_score_min: 'Punteggio minimo ATTENDI (Motore B)',
+  max_pct_per_stock: 'Max % per titolo',
+  max_pct_per_sector: 'Max % per settore',
+  min_pct_defensive: 'Min % in difensivi',
+};
+const BN_RANGES = {
+  drawdown_min_pct: [0, 60, 1], return_3y_max_pct: [0, 500, 10], pe_max: [5, 80, 1],
+  dislocation_min: [0.5, 5, 0.1], net_debt_ebitda_max: [0, 8, 0.1], min_analyst_coverage: [0, 15, 1],
+  catalyst_window_days: [7, 180, 1], buy_score_min: [15, 50, 1], hype_max: [0, 10, 0.5],
+  growth_min_pct: [0, 100, 1], watch_score_min: [10, 40, 1], max_pct_per_stock: [2, 40, 1],
+  max_pct_per_sector: [10, 80, 1], min_pct_defensive: [0, 40, 1],
+};
+
+function toggleBottleneckSliders() {
+  const el = document.getElementById('bn-sliders');
+  el.style.display = el.style.display === 'none' ? 'block' : 'none';
+}
+
+function renderBottleneckSliders() {
+  const groups = [['engine_a', 'Motore A — filtri quantitativi'], ['engine_b', 'Motore B — Bottleneck'], ['portfolio', 'Vincoli di portafoglio']];
+  let html = '';
+  for (const [group, label] of groups) {
+    html += `<div class="card"><b style="font-size:13px">${label}</b>`;
+    for (const key of Object.keys(BN_THRESHOLDS[group])) {
+      const val = BN_THRESHOLDS[group][key];
+      const [min, max, step] = BN_RANGES[key] || [0, 100, 1];
+      html += `
+        <div style="margin-top:10px">
+          <div class="row" style="font-size:12px"><span>${BN_LABELS[key] || key}</span><span class="dim" id="bn-val-${group}-${key}">${val}</span></div>
+          <input type="range" min="${min}" max="${max}" step="${step}" value="${val}" style="width:100%"
+                 oninput="bnSliderChange('${group}','${key}', this.value)">
+        </div>`;
+    }
+    html += '</div>';
+  }
+  document.getElementById('bn-sliders').innerHTML = html;
+}
+
+function bnSliderChange(group, key, value) {
+  const v = parseFloat(value);
+  BN_THRESHOLDS[group][key] = v;
+  document.getElementById(`bn-val-${group}-${key}`).textContent = v;
+  if (BN_LAST_TICKER) analyzeBottleneckTicker(BN_LAST_TICKER, false);
+}
+
+function bnStatusColor(status) {
+  return { IDONEO: 'var(--buy)', A_UN_FILTRO: '#e6a817', DATI_INCOMPLETI: 'var(--dim)', ESCLUSO: 'var(--sell)',
+           COMPRA: 'var(--buy)', ATTENDI: '#e6a817', PASSA: 'var(--sell)' }[status] || 'var(--dim)';
+}
+function bnIcon(status) {
+  return { pass: '✅', fail: '❌', missing: '➖' }[status] || '➖';
+}
+function bnFmt(v) {
+  return v == null ? '—' : (typeof v === 'number' ? Math.round(v * 100) / 100 : v);
+}
+
+function bottleneckFilterRow(f) {
+  return `<div class="row" style="font-size:12px;padding:4px 0;border-bottom:1px solid var(--border)">
+    <span>${bnIcon(f.status)} ${f.label}</span>
+    <span class="dim">${bnFmt(f.value)}${f.unit || ''} ${f.threshold != null ? '(soglia ' + f.threshold + (f.unit || '') + ')' : ''}</span>
+  </div>`;
+}
+
+function bottleneckCard(r) {
+  if (r.error) {
+    return `<div class="card"><div class="row"><b>${r.ticker}</b><span class="dim">${r.error}</span></div></div>`;
+  }
+  const a = r.engine_a, b = r.engine_b, p = r.portfolio;
+  const levelLabel = { motore_a: 'Motore A (fondamentali)', motore_b: 'Motore B (Bottleneck)', portafoglio: 'Vincoli di portafoglio' };
+  const blockedText = r.blocked_by_level
+    ? `<div style="color:var(--sell);font-size:12px;margin-top:8px">⛔ Bloccato a livello: ${levelLabel[r.blocked_by_level]}</div>`
+    : `<div style="color:var(--buy);font-size:12px;margin-top:8px">✅ Nessun livello blocca questo titolo</div>`;
+  return `
+    <div class="card">
+      <div class="row"><b>${r.ticker}</b><span class="dim">${r.name || ''} — ${bnFmt(r.price)}</span></div>
+      <div style="margin-top:8px">
+        <div class="row"><b style="font-size:13px">Motore A — fondamentali</b><span style="color:${bnStatusColor(a.status)};font-weight:700;font-size:12px">${a.status}</span></div>
+        ${a.filters.map(bottleneckFilterRow).join('')}
+      </div>
+      <div style="margin-top:10px">
+        <div class="row"><b style="font-size:13px">Motore B — Bottleneck (${bnFmt(b.total)}/50)</b><span style="color:${bnStatusColor(b.verdict)};font-weight:700;font-size:12px">${b.verdict}</span></div>
+        ${Object.entries(b.scores).map(([k, v]) => `
+          <div class="row" style="font-size:12px;padding:4px 0;border-bottom:1px solid var(--border)">
+            <span>${k}</span><span class="dim">${bnFmt(v)}/10</span>
+          </div>`).join('')}
+      </div>
+      <div style="margin-top:10px">
+        <div class="row"><b style="font-size:13px">Vincoli di portafoglio</b><span class="dim" style="font-size:12px">${p.blocked ? '⛔' : '✅'}</span></div>
+        ${p.checks.map(c => `
+          <div class="row" style="font-size:12px;padding:4px 0;border-bottom:1px solid var(--border)">
+            <span>${bnIcon(c.status)} ${c.label}</span><span class="dim">${bnFmt(c.value)}${c.threshold != null ? ' (soglia ' + c.threshold + ')' : ''}</span>
+          </div>`).join('')}
+      </div>
+      ${blockedText}
+    </div>`;
+}
+
+async function analyzeBottleneckTicker(tickerArg, save) {
+  const ticker = (tickerArg && typeof tickerArg === 'string') ? tickerArg : document.getElementById('bn-input').value.trim();
+  if (!ticker) return;
+  BN_LAST_TICKER = ticker;
+  document.getElementById('bn-result').innerHTML = '<div class="spinner">Analisi in corso…</div>';
+  const res = await fetch(`/api/bottleneck/analyze/${encodeURIComponent(ticker.toUpperCase())}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ thresholds: BN_THRESHOLDS, save: save !== false }),
+  });
+  const data = await res.json();
+  document.getElementById('bn-result').innerHTML = bottleneckCard(data);
+}
+
+async function startBottleneckScan() {
+  const res = await fetch('/api/bottleneck/scan', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ thresholds: BN_THRESHOLDS }),
+  });
+  if (res.status === 409) {
+    document.getElementById('bn-scan-status').textContent = 'Scansione già in corso…';
+  }
+  pollBottleneckScanStatus();
+}
+
+async function pollBottleneckScanStatus() {
+  clearTimeout(BN_SCAN_TIMER);
+  const res = await fetch('/api/bottleneck/scan/status');
+  const s = await res.json();
+  const statusEl = document.getElementById('bn-scan-status');
+  if (s.running) {
+    statusEl.textContent = `🔍 Scansione in corso: ${s.done}/${s.total} titoli…`;
+    BN_SCAN_TIMER = setTimeout(pollBottleneckScanStatus, 4000);
+  } else if (s.finished_at) {
+    statusEl.textContent = `Ultima scansione completata: ${s.finished_at.slice(0, 16).replace('T', ' ')} (${s.total} titoli)`;
+    loadBottleneckScanResults();
+  } else {
+    statusEl.textContent = '';
+  }
+}
+
+async function loadBottleneckScanResults() {
+  const res = await fetch('/api/bottleneck/scan/results');
+  const data = await res.json();
+  const el = document.getElementById('bn-scan-results');
+  if (!data.results.length) {
+    el.innerHTML = `<div class="dim" style="font-size:12px;margin:10px 0">Nessun titolo IDONEO su entrambi i motori nell'ultima scansione (${data.total_scanned} analizzati). Ordinati per dislocazione quando presenti.</div>`;
+    return;
+  }
+  el.innerHTML = '<div class="dim" style="font-size:12px;margin:10px 0 6px">✅ IDONEI su entrambi i motori, ordinati per dislocazione</div>'
+    + data.results.map(bottleneckCard).join('');
+}
+
+function toggleBottleneckAccuracy() {
+  const el = document.getElementById('bn-accuracy');
+  if (el.style.display === 'none') {
+    el.style.display = 'block';
+    loadBottleneckAccuracy();
+  } else {
+    el.style.display = 'none';
+  }
+}
+
+async function loadBottleneckAccuracy() {
+  const el = document.getElementById('bn-accuracy');
+  el.innerHTML = '<div class="spinner">Carico…</div>';
+  const res = await fetch('/api/accuratezza');
+  const data = await res.json();
+  if (!data.per_filter.length) {
+    el.innerHTML = "<div class=\"card dim\" style=\"font-size:12px\">Ancora nessuna decisione ricontrollata a 3/6/12 mesi: torna qui più avanti, il registro si popola con l'uso.</div>";
+    return;
+  }
+  let html = '<div class="card"><b style="font-size:13px">📊 Accuratezza per filtro</b>'
+    + '<div class="dim" style="font-size:11px;margin:4px 0 8px">Tra i titoli esclusi da ciascun filtro, quanti sono poi saliti e quanti scesi.</div>';
+  html += data.per_filter.map(f => `
+    <div class="row" style="font-size:12px;padding:4px 0;border-bottom:1px solid var(--border)">
+      <span>${f.filter}</span>
+      <span class="dim">🟢 ${f.escluso_salito} / 🔴 ${f.escluso_sceso} (${f.pct_salito_dopo_esclusione ?? '—'}% saliti, n=${f.n})</span>
+    </div>`).join('');
+  html += '</div>';
+  if (data.suggestions.length) {
+    html += '<div class="card"><b style="font-size:13px">💡 Suggerimenti di ricalibrazione</b>'
+      + data.suggestions.map(s => `<div class="dim" style="font-size:12px;margin-top:6px">${s}</div>`).join('')
+      + '<div class="dim" style="font-size:11px;margin-top:8px">Solo suggerimenti: le soglie non vengono cambiate automaticamente.</div></div>';
+  }
+  el.innerHTML = html;
 }
 </script>
 </body>

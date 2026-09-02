@@ -275,6 +275,46 @@ github.com → foto profilo in alto a destra → **Settings** →
   costa diverse chiamate, non gira ogni ora); refresh manuale sempre
   disponibile dal pulsante nel tab. Il paniere e i flag FCF/data
   catalizzatore si aggiornano in `config.SCREENER_UNIVERSE`.
+- **Bottleneck 🎯 (screener a due motori con dati live)**: un motore
+  separato dallo Settimanale, pensato per lo screening dell'intero
+  universo (non solo il tuo paniere) con soglie regolabili da slider.
+  - **Motore A** (8 filtri quantitativi, giudicano l'azienda): drawdown dal
+    massimo 52 settimane, tetto sul rendimento a 3 anni, tetto sul P/E,
+    **dislocazione** (il filtro centrale: calo prezzo diviso il calo
+    peggiore tra ricavi ed EBITDA sugli ultimi 4 trimestri — se i
+    fondamentali crescono mentre il prezzo scende, punteggio massimo),
+    FCF TTM positivo, debito netto/EBITDA, copertura analisti minima con
+    consenso non-Sell, catalizzatore (prossimi earnings) entro 3 mesi.
+    Verdetto: **IDONEO** (tutto passato), **A UN FILTRO** (un solo fallito,
+    borderline), **DATI INCOMPLETI** (nessun fallimento ma qualche dato
+    mancante — mai trattato come bocciatura), **ESCLUSO** (2+ filtri
+    falliti).
+  - **Motore B** (Bottleneck Filter personale, 0-10 per criterio, mai
+    mescolato col Motore A): bottleneckPurity, supplyConstraint,
+    growthDocumented, moatStrength, hypeFactor (invertito: più lontano dal
+    massimo, meglio). Verdetto **COMPRA** se somma ≥ 35 e hype ≤ 5 e
+    crescita ricavi ≥ 30%, **ATTENDI** se somma 25-34, **PASSA** altrimenti.
+  - **Vincoli di portafoglio** (terzo livello, sempre mostrato a parte,
+    mai dentro i due motori): max % per titolo, max % per settore, minimo
+    % in difensivi, calcolati sulle posizioni attuali.
+  - **Ricerca singolo ticker** o **"Scansiona universo"** (una lista curata
+    multi-borsa in `config.BOTTLENECK_UNIVERSE` — NYSE/Nasdaq, Borsa
+    Italiana, Xetra, Euronext Parigi/Amsterdam; non è "tutta la borsa",
+    nessuna fonte gratuita elenca ogni titolo quotato al mondo — estendibile
+    a mano aggiungendo simboli alla lista).
+  - **Registro delle decisioni + pagina Accuratezza 📊**: ogni verdetto
+    calcolato viene salvato con ticker, punteggi e soglie usate; un job
+    periodico ricontrolla il prezzo a 3/6/12 mesi di distanza e la sezione
+    "Accuratezza" nel tab mostra, per ogni filtro, quante volte ha escluso
+    un titolo poi salito o sceso — con suggerimenti di ricalibrazione (mai
+    applicati in automatico).
+  - **Limiti onesti sui dati gratuiti**: "quota di mercato" (bottleneckPurity)
+    e il vero massimo storico all-time (hypeFactor) non sono disponibili
+    gratis in modo affidabile — bottleneckPurity usa solo il gross margin,
+    hypeFactor usa il massimo delle ultime 52 settimane come proxy. L'EBITDA
+    trimestrale non è esposto da Yahoo gratis: la dislocazione usa l'EBIT
+    trimestrale come proxy. Ogni filtro mostra comunque il valore letto e
+    la soglia, così è sempre chiaro cosa sta giudicando.
 - **Ricerca ticker con suggerimenti**: scrivendo un simbolo o un nome
   (es. "micro", "bitcoin") negli input di Scanner, Portafoglio e Alert
   compare un menu a tendina con i titoli corrispondenti, da selezionare

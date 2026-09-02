@@ -184,3 +184,88 @@ SECTOR_CONCENTRATION_LIMIT_PCT = 40.0  # regola 4
 MAX_BUY_PER_WEEK = 2                   # regola 7
 POST_JUMP_THRESHOLD_PCT = 15.0         # regola 1: +15% in una seduta = non inseguire
 CATALYST_WINDOW_DAYS = 42              # regola 6: 6 settimane
+
+# --------------------------------------------------------------------------
+# Bottleneck Filter — screener a due motori (tab "🎯 Bottleneck")
+# --------------------------------------------------------------------------
+# Universo scansionabile. Nessuna API a pagamento espone gratis l'elenco
+# completo e aggiornato di ogni titolo quotato su NYSE+Nasdaq+Borsa
+# Italiana+Xetra+Euronext (sono decine di migliaia di simboli): una lista
+# così va comprata da un vendor dati. Questa è una lista curata, ampia e
+# multi-borsa che copre i principali nomi liquidi di ciascun mercato — va
+# vista come punto di partenza estendibile a mano aggiungendo ticker qui
+# sotto, non come "tutta la borsa". Formato simboli Yahoo: suffisso .MI
+# (Borsa Italiana), .DE (Xetra), .PA (Euronext Parigi), .AS (Euronext
+# Amsterdam), nessun suffisso per NYSE/Nasdaq.
+BOTTLENECK_UNIVERSE = [
+    # --- NYSE / Nasdaq: tech, semiconduttori, cloud ---
+    "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "AVGO", "ORCL", "CRM",
+    "ADBE", "AMD", "QCOM", "TXN", "INTC", "MU", "ASML", "TSM", "NOW", "INTU",
+    "PANW", "FTNT", "CRWD", "ZS", "SNPS", "CDNS", "ANET", "LRCX", "KLAC",
+    "AMAT", "ON", "MRVL", "WDC", "STX", "SNDK", "DELL", "HPQ", "CSCO", "IBM",
+    "UBER", "ABNB", "SHOP", "NET", "DDOG", "SNOW", "MDB", "TEAM", "WDAY",
+    "PLTR", "RBLX", "SPOT", "PYPL", "SQ",
+    # --- NYSE / Nasdaq: e-commerce, media, consumo ---
+    "JD", "BABA", "PDD", "MELI", "NFLX", "DIS", "SBUX", "MCD", "NKE", "TGT",
+    "COST", "WMT", "HD", "LOW", "TJX",
+    # --- NYSE / Nasdaq: healthcare / difensivo ---
+    "JNJ", "PFE", "MRK", "ABBV", "LLY", "UNH", "ZTS", "VRTX", "REGN", "GILD",
+    "MRNA", "AMGN", "BMY", "PG", "KO", "PEP", "CL", "MDLZ",
+    # --- NYSE / Nasdaq: industriali, difesa, materiali ---
+    "LMT", "RTX", "NOC", "GD", "BA", "CAT", "DE", "HON", "GE", "MMM", "XYL",
+    "MP", "SOLS", "FCX", "NEM",
+    # --- NYSE / Nasdaq: energia ---
+    "XOM", "CVX", "COP", "SLB", "OXY", "EOG",
+    # --- NYSE / Nasdaq: finanza ---
+    "V", "MA", "JPM", "BAC", "GS", "MS", "AXP", "BRK-B", "SPGI", "BLK",
+    # --- Asia (ADR/quotate Nasdaq/NYSE) ---
+    "000660.KS",
+    # --- Borsa Italiana ---
+    "ENI.MI", "ENEL.MI", "ISP.MI", "UCG.MI", "STLAM.MI", "RACE.MI",
+    "STMMI.MI", "PRY.MI", "TIT.MI", "G.MI", "MONC.MI", "REC.MI", "CPR.MI",
+    "AMP.MI", "LDO.MI",
+    # --- Xetra (Germania) ---
+    "SAP.DE", "SIE.DE", "ALV.DE", "DTE.DE", "AIR.DE", "BAS.DE", "BAYN.DE",
+    "BMW.DE", "MBG.DE", "VOW3.DE", "MRK.DE", "MUV2.DE", "DHL.DE", "IFX.DE",
+    "ADS.DE",
+    # --- Euronext Parigi ---
+    "MC.PA", "OR.PA", "SAN.PA", "TTE.PA", "AI.PA", "SU.PA", "SAF.PA",
+    "AIR.PA", "DG.PA", "BNP.PA", "CS.PA", "ORA.PA", "STLAP.PA", "RMS.PA",
+    "EL.PA",
+    # --- Euronext Amsterdam ---
+    "ASML.AS", "ADYEN.AS", "HEIA.AS", "PHIA.AS", "AD.AS", "WKL.AS", "INGA.AS",
+    "RAND.AS", "AKZA.AS", "DSFIR.AS",
+]
+
+BOTTLENECK_DEFAULTS = {
+    # Motore A — filtri quantitativi (regole 1-8 del prompt)
+    "engine_a": {
+        "drawdown_min_pct": 20.0,      # regola 1: almeno -20% dal massimo 52w
+        "return_3y_max_pct": 200.0,    # regola 2: tetto rendimento 3y (evita titoli già troppo saliti)
+        "pe_max": 35.0,                # regola 3
+        "dislocation_min": 1.5,        # regola 4: calo prezzo >= 1.5x il calo peggiore ricavi/EBITDA
+        "net_debt_ebitda_max": 3.0,    # regola 6
+        "min_analyst_coverage": 3,     # regola 7
+        "catalyst_window_days": 90,    # regola 8: 3 mesi
+    },
+    # Motore B — Bottleneck Filter personale (0-10 per sotto-punteggio)
+    "engine_b": {
+        "buy_score_min": 35,           # somma >= 35
+        "hype_max": 5,                 # hype <= 5
+        "growth_min_pct": 30.0,        # crescita ricavi YoY >= 30%
+        "watch_score_min": 25,         # somma 25-34 = ATTENDI
+    },
+    # Livello 3 — vincoli di portafoglio (mai dentro i due motori)
+    "portfolio": {
+        "max_pct_per_stock": 15.0,
+        "max_pct_per_sector": 40.0,
+        "min_pct_defensive": 10.0,
+    },
+}
+
+# Settori "difensivi" per il vincolo minimo di portafoglio (regola 3, livello 3).
+DEFENSIVE_SECTORS = {"Difensivo", "Healthcare", "Salute", "Beni di consumo primari", "Utility"}
+
+# Cache locale delle fondamentali (24h) per non saturare Yahoo durante una
+# scansione dell'intero universo.
+BOTTLENECK_CACHE_TTL_SECONDS = 24 * 3600
