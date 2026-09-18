@@ -110,21 +110,26 @@ WATCH_LEVELS = [
 # "live" — sarebbe disonesto far finta di poterli scaricare gratis in modo
 # solido.
 SCREENER_UNIVERSE = [
-    # --- Già in portafoglio ---
-    {"ticker": "ASML", "name": "ASML Holding", "category": "owned", "owner": "shared",
-     "sector": "Semiconduttori/Memoria", "role": "Core - monopolio EUV"},
-    {"ticker": "MSFT", "name": "Microsoft", "category": "owned", "owner": "shared",
-     "sector": "Cloud/Software", "role": "Core - cloud Azure"},
+    # --- Già in portafoglio (aggiornato Settembre 2026, portafogli reali) ---
+    # owner="shared": posizione tenuta da entrambi indipendentemente (conta
+    # nel calcolo di concentrazione di entrambi i portafogli, non è una
+    # posizione unica condivisa).
     {"ticker": "GOOGL", "name": "Alphabet", "category": "owned", "owner": "shared",
-     "sector": "Cloud/Software", "role": "Core - search/AI"},
+     "sector": "Cloud/Software", "role": "Core - search/AI, in entrambi i portafogli"},
     {"ticker": "JNJ", "name": "Johnson & Johnson", "category": "owned", "owner": "shared",
-     "sector": "Difensivo", "role": "DIFENSIVO - non vendere mai", "never_sell": True},
-    {"ticker": "000660.KS", "name": "SK Hynix", "category": "owned", "owner": "mohamed",
-     "sector": "Semiconduttori/Memoria", "role": "Core - memoria, PE più basso"},
-    {"ticker": "INTU", "name": "Intuit", "category": "owned", "owner": "micaela",
-     "sector": "Cloud/Software", "role": "Core - software fiscale, upside 76%"},
-    {"ticker": "JD", "name": "JD.com", "category": "owned", "owner": "micaela",
-     "sector": "E-commerce Asia", "role": "Core - e-commerce Cina, Burry top-3"},
+     "sector": "Difensivo", "role": "DIFENSIVO - non vendere mai, in entrambi i portafogli", "never_sell": True},
+    {"ticker": "IREN", "name": "IREN Limited", "category": "owned", "owner": "shared",
+     "sector": "Infrastruttura/Energia", "role": "Bitcoin mining + AI datacenter, in entrambi i portafogli"},
+    {"ticker": "CI", "name": "Cigna", "category": "owned", "owner": "mohamed",
+     "sector": "Difensivo", "role": "Healthcare/assicurazioni"},
+    {"ticker": "CCJ", "name": "Cameco", "category": "owned", "owner": "mohamed",
+     "sector": "Materiali critici", "role": "Uranio/combustibile nucleare"},
+    {"ticker": "ASML", "name": "ASML Holding", "category": "owned", "owner": "micaela",
+     "sector": "Semiconduttori/Memoria", "role": "Core - monopolio EUV"},
+    {"ticker": "MSFT", "name": "Microsoft", "category": "owned", "owner": "micaela",
+     "sector": "Cloud/Software", "role": "Core - cloud Azure"},
+    {"ticker": "STN", "name": "Stantec", "category": "owned", "owner": "micaela",
+     "sector": "Infrastruttura/Energia", "role": "Ingegneria/consulenza infrastrutturale"},
 
     # --- Watchlist: non ancora comprati ---
     {"ticker": "AVGO", "name": "Broadcom", "category": "watchlist", "sector": "Semiconduttori/Memoria",
@@ -180,7 +185,7 @@ SCREENER_UNIVERSE = [
      "exclusion_reason": "Trial falliti 2 volte in 8 mesi, guidance tagliata ripetutamente"},
 ]
 
-SECTOR_CONCENTRATION_LIMIT_PCT = 40.0  # regola 4
+SECTOR_CONCENTRATION_LIMIT_PCT = 25.0  # regola 4 (aggiornato: max 25% per settore)
 MAX_BUY_PER_WEEK = 2                   # regola 7
 POST_JUMP_THRESHOLD_PCT = 15.0         # regola 1: +15% in una seduta = non inseguire
 CATALYST_WINDOW_DAYS = 42              # regola 6: 6 settimane
@@ -251,15 +256,16 @@ BOTTLENECK_DEFAULTS = {
     # Motore B — Bottleneck Filter personale (0-10 per sotto-punteggio)
     "engine_b": {
         "buy_score_min": 35,           # somma >= 35
-        "hype_max": 5,                 # hype <= 5
+        "hype_max": 5,                 # hype <= 5 per COMPRA
+        "hype_attendi_max": 7,         # hype 5-7 (anche con somma alta) = ATTENDI, mai COMPRA
         "growth_min_pct": 30.0,        # crescita ricavi YoY >= 30%
         "watch_score_min": 25,         # somma 25-34 = ATTENDI
     },
     # Livello 3 — vincoli di portafoglio (mai dentro i due motori)
     "portfolio": {
         "max_pct_per_stock": 15.0,
-        "max_pct_per_sector": 40.0,
-        "min_pct_defensive": 10.0,
+        "max_pct_per_sector": 25.0,
+        "min_pct_defensive": 20.0,
     },
 }
 
@@ -342,7 +348,7 @@ NEWS_SEVERITY_LABELS = [
 # decisione BUY/HOLD/SELL/DATA_UNAVAILABLE. Pesi e soglie fissi e versionati:
 # se li cambi, incrementa DECISION_ENGINE_VERSION così lo storico resta
 # confrontabile tra versioni diverse delle regole.
-DECISION_ENGINE_VERSION = "1.0"
+DECISION_ENGINE_VERSION = "1.1"
 BOTTLENECK_FILTER_VERSION = "1.0"
 
 DECISION_WEIGHTS = {"technical": 0.35, "fundamental": 0.30, "bottleneck": 0.20, "news": 0.15}
@@ -356,6 +362,14 @@ DECISION_SELL_THRESHOLD = 35.0
 # 0.50 di peso insieme) gonfino artificialmente il punteggio invece di
 # renderlo più prudente.
 DECISION_MIN_WEIGHT_COVERAGE = 0.65
+
+# Campi considerati "critici" per un BUY (chiavi dei filtri di Motore A):
+# se uno di questi manca (status "missing"), il BUY è bloccato anche se la
+# copertura totale supera la soglia sopra — un punteggio alto non basta se
+# manca proprio il dato che verificherebbe la tesi (caso reale: ORCL con
+# FCF non disponibile). Aggiorna questa lista se aggiungi nuovi filtri a
+# compute_engine_a in app.py.
+CRITICAL_FIELDS_FOR_BUY = ["fcf", "net_debt_ebitda"]
 
 # Non ricalcolare il Decision Engine per lo stesso ticker più spesso di
 # così, anche se il tick automatico gira ogni 10 minuti: i dati (prezzo

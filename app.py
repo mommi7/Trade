@@ -959,10 +959,13 @@ def compute_engine_b(combined, thresholds):
         return {"scores": scores, "total": None, "verdict": "DATI_INCOMPLETI", "missing": missing}
 
     total = round(sum(scores.values()), 1)
+    hype_attendi_max = thresholds.get("hype_attendi_max", 7)
     if total >= thresholds["buy_score_min"] and scores["hypeFactor"] <= thresholds["hype_max"] \
             and (growth_pct or 0) >= thresholds["growth_min_pct"]:
         verdict = "COMPRA"
-    elif total >= thresholds["watch_score_min"]:
+    elif total >= thresholds["watch_score_min"] or thresholds["hype_max"] < scores["hypeFactor"] <= hype_attendi_max:
+        # ATTENDI anche con somma alta se l'hype è 5-7: "eccellente azienda,
+        # entry non ancora giusto" — mai COMPRA solo perché il totale è alto.
         verdict = "ATTENDI"
     else:
         verdict = "PASSA"
@@ -2551,7 +2554,33 @@ def evaluate_decision(ticker):
 
     layers = {"technical": technical_layer, "fundamental": fundamental_layer,
               "bottleneck": bottleneck_layer, "news": news_layer}
-    return _finalize_decision(ticker, price, layers, data_sources)
+    result = _finalize_decision(ticker, price, layers, data_sources)
+
+    # Sezione 28: lo Screener Settimanale (7 regole, indipendente) resta il
+    # secondo parere. Se il ticker è nella sua lista, mostralo sempre a
+    # fianco del Decision Engine — mai nasconderlo in caso di conflitto.
+    spec = SCREENER_BY_TICKER.get(ticker)
+    if spec:
+        result["weekly_screener"] = {
+            "category": spec["category"],
+            "fcf_negative": bool(spec.get("fcf_negative")),
+            "note": spec.get("note") or spec.get("exclusion_reason"),
+            "conflict": result["decision"] in ("BUY", "BUY_BLOCKED") and (
+                spec.get("fcf_negative") or spec["category"] == "excluded"
+            ),
+        }
+    return result
+
+
+def _critical_fields_missing(layers):
+    """Ritorna le chiavi di config.CRITICAL_FIELDS_FOR_BUY il cui filtro di
+    Motore A è "missing" (dato non disponibile) — oppure TUTTE se il
+    livello fundamental è del tutto assente (fetch fallito)."""
+    fundamental_raw = layers["fundamental"]["raw"]
+    if not fundamental_raw or "filters" not in fundamental_raw:
+        return list(config.CRITICAL_FIELDS_FOR_BUY)
+    statuses = {f["key"]: f["status"] for f in fundamental_raw["filters"]}
+    return [key for key in config.CRITICAL_FIELDS_FOR_BUY if statuses.get(key, "missing") == "missing"]
 
 
 def _finalize_decision(ticker, price, layers, data_sources, decision_override=None, override_codes=None):
@@ -2568,6 +2597,7 @@ def _finalize_decision(ticker, price, layers, data_sources, decision_override=No
     for layer in layers.values():
         codes.extend(layer["codes"])
 
+    coverage_pct = None
     if decision_override:
         decision, final_score = decision_override, None
         codes = (override_codes or []) + codes
@@ -2583,6 +2613,7 @@ def _finalize_decision(ticker, price, layers, data_sources, decision_override=No
             contribution = (100 - layer["score"]) if name == "news" else layer["score"]
             weighted_sum += contribution * weights[name]
             total_weight += weights[name]
+        coverage_pct = round(total_weight * 100, 1)
         if total_weight <= 0:
             decision, final_score = "DATA_UNAVAILABLE", None
             codes.append("DATA-UNAVAILABLE-ALL-LAYERS")
@@ -2604,6 +2635,17 @@ def _finalize_decision(ticker, price, layers, data_sources, decision_override=No
                 decision = "SELL"
             else:
                 decision = "HOLD"
+
+            # Critical-Data Gate: anche con copertura sufficiente, un BUY
+            # non può passare se manca un campo critico (FCF, debito) —
+            # sono proprio i dati che confermerebbero o smentirebbero la
+            # tesi. "BUY_BLOCKED" è uno stato esplicito, diverso da un HOLD
+            # generico, per non nasconderlo all'utente.
+            if decision == "BUY":
+                missing_critical = _critical_fields_missing(layers)
+                if missing_critical:
+                    decision = "BUY_BLOCKED"
+                    codes.append("HARD-BLOCK-CRITICAL-FUNDAMENTAL-MISSING:" + ",".join(missing_critical))
 
     changed = previous_decision is not None and previous_decision != decision
 
@@ -2630,7 +2672,7 @@ def _finalize_decision(ticker, price, layers, data_sources, decision_override=No
 
     result = {
         "ticker": ticker, "price": price, "decision": decision, "previous_decision": previous_decision,
-        "changed": changed, "final_score": final_score, "reason_codes": codes,
+        "changed": changed, "final_score": final_score, "coverage_pct": coverage_pct, "reason_codes": codes,
         "filter_version": config.DECISION_ENGINE_VERSION,
         "layers": {k: v["score"] for k, v in layers.items()},
         "data_sources": data_sources,
@@ -2643,14 +2685,20 @@ def _finalize_decision(ticker, price, layers, data_sources, decision_override=No
 def notify_decision_change(result):
     """Alert strutturato (MAI testo generativo), solo su cambio di
     decisione rispetto all'ultima registrata — regola di transizione del
-    Decision Engine, niente spam a parità di stato."""
-    lines = [
-        "CECCHINO PRO", "",
-        result["ticker"],
-        f"Signal: {result['previous_decision']} → {result['decision']}", "",
-    ]
+    Decision Engine, niente spam a parità di stato. BUY_BLOCKED ha un
+    avviso dedicato (regola 36): mai un finto silenzio quando un BUY viene
+    fermato dai gate sui dati."""
+    lines = ["CECCHINO PRO", ""]
+    if result["decision"] == "BUY_BLOCKED":
+        lines += ["⚠ ANALISI BLOCCATA — DATI INSUFFICIENTI", "",
+                   f"{result['ticker']}: il punteggio suggerirebbe BUY ma mancano dati "
+                   f"critici per verificarlo (vedi Reasons sotto). Decisione: BUY_BLOCKED.", ""]
+    else:
+        lines += [result["ticker"], f"Signal: {result['previous_decision']} → {result['decision']}", ""]
     if result["final_score"] is not None:
         lines += [f"Score: {result['final_score']}/100", ""]
+    if result.get("coverage_pct") is not None:
+        lines += [f"Data coverage: {result['coverage_pct']}%", ""]
     if result["reason_codes"]:
         lines.append("Reasons:")
         lines += [f"- {code}" for code in result["reason_codes"][:8]]
@@ -4786,7 +4834,7 @@ async function scanTicker() {
 }
 
 function decisionColor(d) {
-  return { BUY: 'var(--buy)', SELL: 'var(--sell)', HOLD: '#eab308', DATA_UNAVAILABLE: 'var(--dim)' }[d] || 'var(--dim)';
+  return { BUY: 'var(--buy)', SELL: 'var(--sell)', HOLD: '#eab308', BUY_BLOCKED: 'var(--sell)', DATA_UNAVAILABLE: 'var(--dim)' }[d] || 'var(--dim)';
 }
 
 async function loadDecision(ticker) {
@@ -4796,22 +4844,33 @@ async function loadDecision(ticker) {
     const res = await fetch(`/api/decisions/${ticker}`);
     const d = await res.json();
     const scoreLine = d.final_score != null ? `<div class="metric"><div class="val">${d.final_score}/100</div><div class="lbl">Final score</div></div>` : '';
+    const coverageLine = d.coverage_pct != null ? `<div class="metric"><div class="val" style="color:${d.coverage_pct >= 65 ? 'var(--buy)' : 'var(--sell)'}">${d.coverage_pct}%${d.coverage_pct >= 65 ? ' ✓' : ' ⚠'}</div><div class="lbl">Data coverage</div></div>` : '';
     const layers = d.layers ? Object.entries(d.layers).map(([k, v]) => `
-      <div class="metric"><div class="val">${v != null ? Math.round(v) : '—'}</div><div class="lbl">${k}</div></div>
+      <div class="metric"><div class="val">${v != null ? Math.round(v) : '—'}</div><div class="lbl">${k}${v == null ? ' ⚠' : ''}</div></div>
     `).join('') : '';
     const codes = (d.reason_codes || []).map(c => `<div>• ${c}</div>`).join('') || '<div class="dim">Nessun codice motivazione</div>';
     const lowCoverage = (d.reason_codes || []).some(c => c.startsWith('DATA-COVERAGE-LOW'));
+    const blocked = d.decision === 'BUY_BLOCKED';
     const coverageNote = lowCoverage
-      ? `<div style="margin-top:8px;padding:8px;border-radius:8px;background:rgba(234,179,8,0.12);border:1px solid rgba(234,179,8,0.3);font-size:12px">⚠️ Troppi dati mancanti (vedi "—" sopra) per fidarsi di un BUY/SELL: la decisione resta HOLD per prudenza, qualunque fosse il punteggio calcolato solo sui livelli disponibili.</div>`
+      ? `<div style="margin-top:8px;padding:8px;border-radius:8px;background:rgba(234,179,8,0.12);border:1px solid rgba(234,179,8,0.3);font-size:12px">⚠️ DATI INSUFFICIENTI — SEGNALE BLOCCATO. Troppi dati mancanti per fidarsi di un BUY/SELL: la decisione resta HOLD per prudenza, qualunque fosse il punteggio calcolato solo sui livelli disponibili.</div>`
+      : blocked
+      ? `<div style="margin-top:8px;padding:8px;border-radius:8px;background:rgba(239,68,68,0.12);border:1px solid rgba(239,68,68,0.3);font-size:12px">🚫 BUY BLOCCATO: il punteggio suggerirebbe un acquisto, ma manca un dato critico (es. free cash flow) necessario a verificarlo davvero.</div>`
+      : '';
+    const ws = d.weekly_screener;
+    const wsNote = ws
+      ? `<div style="margin-top:8px;padding:8px;border-radius:8px;${ws.conflict ? 'background:rgba(239,68,68,0.12);border:1px solid rgba(239,68,68,0.3)' : 'background:var(--card2);border:1px solid var(--border)'};font-size:12px">
+          ${ws.conflict ? '⚠️ In conflitto con ' : ''}📅 Screener Settimanale: <b>${ws.category}</b>${ws.fcf_negative ? ' — FCF negativo' : ''}${ws.note ? ' — ' + ws.note : ''}
+        </div>`
       : '';
     const transition = d.previous_decision ? `${d.previous_decision} → ${d.decision}` : d.decision;
     el.innerHTML = `
       <div class="card">
         <div class="row"><b style="font-size:14px">🧭 Decision Engine — PERCHÉ</b>
           <span style="color:${decisionColor(d.decision)};font-weight:700">${transition}</span></div>
-        <div class="metrics" style="margin-top:8px">${scoreLine}${layers}</div>
+        <div class="metrics" style="margin-top:8px">${scoreLine}${coverageLine}${layers}</div>
         <div class="reasons" style="margin-top:8px">${codes}</div>
         ${coverageNote}
+        ${wsNote}
         <div class="dim" style="font-size:11px;margin-top:8px">Filter version: ${d.filter_version} — nessuna AI, formula fissa e versionata.</div>
       </div>`;
   } catch (e) {

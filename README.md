@@ -353,6 +353,26 @@ github.com → foto profilo in alto a destra → **Settings** →
   frode confermata) e logga ogni evento distinto in `news_events`
   (`/api/news/<ticker>`) — nessuna interpretazione AI, stesso input
   stesso output sempre.
+  - **Data Coverage Gate**: la copertura dati è calcolata sui **pesi**
+    dei 4 livelli (tecnico 35%, fondamentale 30%, bottleneck 20%, news
+    15%), non sul numero di livelli disponibili — mancano 2 livelli su 4
+    non vuol dire "50%" se quei due pesano insieme il 45% o il 50% dei
+    pesi originali. Sotto il 65% (`config.DECISION_MIN_WEIGHT_COVERAGE`)
+    la decisione resta sempre **HOLD**, qualunque punteggio risulti dai
+    soli livelli disponibili — evita che dati mancanti proprio nei
+    livelli più critici gonfino artificialmente lo score (caso reale:
+    ORCL con fondamentali non disponibili dava un falso BUY prima di
+    questa correzione).
+  - **Critical-Data Gate**: anche con copertura sufficiente, un BUY
+    diventa **BUY_BLOCKED** (stato esplicito, mostrato in rosso, mai
+    confuso con un HOLD generico) se manca un dato critico —
+    `config.CRITICAL_FIELDS_FOR_BUY` (FCF, debito netto/EBITDA) — perché
+    proprio quel dato servirebbe a verificare la tesi.
+  - **Confronto con lo Screener Settimanale**: se il ticker è anche
+    nella lista delle 25 azioni del Settimanale, la card mostra sempre
+    il suo giudizio a fianco (es. "watchlist — FCF negativo") — i due
+    sistemi restano indipendenti apposta, un conflitto non viene mai
+    nascosto.
 - **Ricerca ticker con suggerimenti**: scrivendo un simbolo o un nome
   (es. "micro", "bitcoin") negli input di Scanner, Portafoglio e Alert
   compare un menu a tendina con i titoli corrispondenti, da selezionare
@@ -456,6 +476,23 @@ niente altro da toccare:
   puramente aggiuntivi: se `GEMINI_API_KEY` non è impostata non fanno
   nessuna chiamata di rete e l'app si comporta esattamente come senza
   queste funzioni.
+- **Test di regressione del Decision Engine**: `tests/test_decision_engine.py`
+  (stdlib `unittest`, nessuna dipendenza in più, nessuna rete) copre i 5
+  scenari critici — ORCL con dati mancanti (deve restare HOLD, mai BUY),
+  dati completi (comportamento invariato), un livello mancante sopra
+  soglia, due livelli mancanti sotto soglia, e il Critical-Data Gate
+  (FCF mancante blocca il BUY anche con copertura piena). Si esegue con:
+  ```bash
+  python3 -m unittest tests.test_decision_engine -v
+  ```
+- **Limiti onesti / non ancora fatto**: nessuna integrazione con SEC
+  EDGAR, nessuna gerarchia di fonti notizie a più livelli (Reuters/
+  Bloomberg/WSJ richiederebbero API a pagamento, incompatibili con il
+  vincolo "zero costi" di questo progetto), nessun motore di
+  deduplicazione/conflitto tra fonti multiple, nessun tracking
+  istituzionale (13F/DataRoma). Il motore notizie resta a fonte singola
+  (Yahoo) con classificazione a parole chiave e rilevamento negazioni —
+  solido per il caso d'uso attuale, non un vero aggregatore multi-fonte.
 - Due portafogli in un'app a singolo tenant: la tabella `tickers` ha una
   colonna `owner` (`mohamed`/`micaela`/`shared`) usata solo dal controllo
   di concentrazione dello screener a 25 titoli, non un vero multi-utente —
