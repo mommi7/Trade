@@ -329,12 +329,43 @@ def set_telegram_chat_id(chat_id):
 # --------------------------------------------------------------------------
 # Impostazioni - indirizzo email e chat Telegram per gli alert
 # --------------------------------------------------------------------------
+_TELEGRAM_BOT_INFO_CACHE = {"data": None, "at": 0}
+
+
+def get_telegram_bot_info():
+    """Username/nome del bot via Telegram getMe, per mostrare "@NomeBot" e
+    costruire il link t.me/NomeBot corretto (mai inventato/hardcoded).
+    Cache di processo: il bot non cambia username durante l'esecuzione."""
+    if not config.TELEGRAM_BOT_TOKEN:
+        return None
+    now = time.time()
+    if _TELEGRAM_BOT_INFO_CACHE["data"] and now - _TELEGRAM_BOT_INFO_CACHE["at"] < 3600:
+        return _TELEGRAM_BOT_INFO_CACHE["data"]
+    try:
+        url = f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/getMe"
+        r = requests.get(url, timeout=8)
+        j = r.json()
+        if not j.get("ok"):
+            return None
+        result = j["result"]
+        info = {"username": result.get("username"), "name": result.get("first_name")}
+        _TELEGRAM_BOT_INFO_CACHE["data"] = info
+        _TELEGRAM_BOT_INFO_CACHE["at"] = now
+        return info
+    except Exception as e:
+        print(f"Telegram getMe fallito: {e}")
+        return None
+
+
 @app.route("/api/settings", methods=["GET"])
 def api_settings_get():
+    bot_info = get_telegram_bot_info()
     return jsonify({
         "email": get_alert_email(),
         "telegram_chat_id": get_telegram_chat_id(),
         "telegram_bot_configured": bool(config.TELEGRAM_BOT_TOKEN),
+        "telegram_bot_username": bot_info["username"] if bot_info else None,
+        "telegram_bot_name": bot_info["name"] if bot_info else None,
     })
 
 
@@ -383,6 +414,30 @@ def api_settings_telegram_detect():
             return jsonify({"error": "Chat non trovata nell'ultimo messaggio"}), 404
         set_telegram_chat_id(str(chat_id))
         return jsonify({"ok": True, "telegram_chat_id": str(chat_id), "name": name})
+    except Exception as e:
+        return jsonify({"error": f"Errore di rete: {e}"}), 500
+
+
+@app.route("/api/settings/telegram/test", methods=["POST"])
+def api_settings_telegram_test():
+    """Manda un messaggio di prova al chat_id già collegato, per dare
+    conferma concreta ("è arrivato davvero") invece di fidarsi solo dello
+    stato salvato lato server."""
+    chat_id = get_telegram_chat_id()
+    if not chat_id:
+        return jsonify({"error": "Nessuna chat Telegram collegata"}), 400
+    if not config.TELEGRAM_BOT_TOKEN:
+        return jsonify({"error": "Bot Telegram non configurato (manca TELEGRAM_BOT_TOKEN)"}), 400
+    try:
+        url = f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/sendMessage"
+        r = requests.post(url, json={
+            "chat_id": chat_id,
+            "text": "✅ Cecchino Pro — messaggio di prova. Se lo leggi, il collegamento funziona.",
+        }, timeout=10)
+        j = r.json()
+        if not j.get("ok"):
+            return jsonify({"error": j.get("description", "invio fallito")}), 400
+        return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"error": f"Errore di rete: {e}"}), 500
 
@@ -3771,6 +3826,10 @@ INDEX_HTML = r"""
   --blue: #3b82f6;
 }
 * { box-sizing: border-box; }
+button:focus-visible, input:focus-visible, a:focus-visible, summary:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: 2px;
+}
 body {
   margin: 0;
   background: var(--bg);
@@ -3920,17 +3979,96 @@ nav.bottom button.active { color: var(--blue); }
   inset: 0;
   background: var(--bg);
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: center;
   z-index: 999;
   padding: 20px;
+  overflow-y: auto;
 }
-#email-gate .box { max-width: 360px; text-align: center; }
-#email-gate h1 { font-size: 24px; }
-#email-gate p { color: var(--dim); font-size: 14px; line-height: 1.5; }
-#email-gate input { width: 100%; margin-top: 18px; text-align: center; }
-#email-gate button { width: 100%; margin-top: 10px; }
-#email-gate .err { color: var(--sell); font-size: 13px; margin-top: 8px; min-height: 16px; }
+#email-gate .box { max-width: 420px; width: 100%; margin: 24px 0; }
+
+.gate-header { text-align: center; margin-bottom: 20px; }
+.gate-header .gate-icon { font-size: 34px; line-height: 1; }
+.gate-header h1 { font-size: 22px; margin: 8px 0 4px 0; }
+.gate-header .gate-sub { color: var(--dim); font-size: 14px; line-height: 1.5; margin: 0; }
+
+.bot-card {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 14px;
+  margin-bottom: 18px;
+}
+.bot-avatar {
+  width: 42px; height: 42px; border-radius: 50%;
+  background: rgba(59,130,246,0.18);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 20px; flex-shrink: 0;
+}
+.bot-info { flex: 1; min-width: 0; }
+.bot-info .bot-name { font-weight: 700; font-size: 14px; }
+.bot-info .bot-username { color: var(--dim); font-size: 12px; }
+.bot-open-btn {
+  display: inline-block; white-space: nowrap;
+  background: var(--blue); color: white; font-weight: 600;
+  font-size: 13px; padding: 8px 12px; border-radius: 8px;
+  text-decoration: none; flex-shrink: 0;
+}
+
+.steps { margin-bottom: 18px; }
+.step { display: flex; gap: 12px; padding: 8px 0; }
+.step-num {
+  width: 26px; height: 26px; border-radius: 50%; flex-shrink: 0;
+  background: var(--card2); border: 1px solid var(--border);
+  display: flex; align-items: center; justify-content: center;
+  font-weight: 700; font-size: 13px; color: var(--dim);
+}
+.step-body { padding-top: 2px; }
+.step-title { font-weight: 600; font-size: 14px; }
+.step-desc { color: var(--dim); font-size: 13px; margin-top: 2px; line-height: 1.4; }
+.step-desc code {
+  background: var(--card2); border: 1px solid var(--border);
+  border-radius: 4px; padding: 1px 5px; font-size: 12px;
+}
+
+.gate-status {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 13px; color: var(--dim);
+  padding: 10px 12px; border-radius: 8px;
+  background: var(--card2); margin-bottom: 12px;
+}
+.gate-status.checking { color: var(--blue); }
+.gate-status.connected { color: var(--buy); background: rgba(34,197,94,0.12); }
+.gate-status .spin {
+  width: 13px; height: 13px; border-radius: 50%;
+  border: 2px solid currentColor; border-top-color: transparent;
+  animation: gate-spin 0.7s linear infinite; flex-shrink: 0;
+}
+@keyframes gate-spin { to { transform: rotate(360deg); } }
+
+#gate-connect-btn { width: 100%; padding: 13px; font-size: 15px; }
+#gate-connect-btn:disabled { opacity: 0.6; cursor: default; }
+.gate-hint { color: var(--dim); font-size: 12px; margin-top: 8px; line-height: 1.4; text-align: center; }
+#email-gate .err {
+  color: var(--sell); font-size: 13px; margin-top: 10px; line-height: 1.5;
+  background: rgba(239,68,68,0.10); border: 1px solid rgba(239,68,68,0.3);
+  border-radius: 8px; padding: 10px; display: none;
+}
+#email-gate .err.show { display: block; }
+
+.gate-fallback { margin-top: 18px; }
+.gate-fallback summary {
+  cursor: pointer; font-size: 13px; color: var(--dim);
+  padding: 8px 0; list-style: none;
+}
+.gate-fallback summary::-webkit-details-marker { display: none; }
+.gate-fallback summary::before { content: "▸ "; }
+.gate-fallback[open] summary::before { content: "▾ "; }
+.gate-fallback input { width: 100%; margin-top: 8px; }
+.gate-fallback button { width: 100%; margin-top: 8px; }
 
 #settings-modal {
   position: fixed;
@@ -3970,13 +4108,60 @@ nav.bottom button.active { color: var(--blue); }
 
 <div id="email-gate" style="display:none">
   <div class="box">
-    <h1>🎯 Cecchino Pro</h1>
-    <p>I segnali arrivano su Telegram, niente email. Se non l'hai già fatto: apri Telegram, cerca il tuo bot e scrivigli un messaggio qualsiasi (es. "ciao"), poi torna qui e premi il pulsante.</p>
-    <button onclick="detectAndStartTelegram()">📡 Ho scritto al bot — collega</button>
-    <p style="font-size:12px;margin-top:16px">Oppure inserisci il chat ID a mano:</p>
-    <input id="gate-telegram" type="text" placeholder="es. 123456789" autocomplete="off">
-    <button class="secondary" onclick="saveGateTelegram()">Collega</button>
+    <div class="gate-header">
+      <div class="gate-icon">🎯</div>
+      <h1>Cecchino Pro</h1>
+      <p class="gate-sub">Per ricevere gli avvisi di Cecchino Pro devi prima aprire il bot su Telegram e inviargli un messaggio.</p>
+    </div>
+
+    <div class="bot-card">
+      <div class="bot-avatar">✈️</div>
+      <div class="bot-info">
+        <div class="bot-name" id="gate-bot-name">Bot Telegram</div>
+        <div class="bot-username" id="gate-bot-username">Caricamento…</div>
+      </div>
+      <a class="bot-open-btn" id="gate-bot-link" href="https://telegram.org" target="_blank" rel="noopener">Apri Telegram</a>
+    </div>
+
+    <div class="steps">
+      <div class="step">
+        <div class="step-num">1</div>
+        <div class="step-body">
+          <div class="step-title">Apri Telegram</div>
+          <div class="step-desc">Cerca il bot mostrato sopra (o tocca "Apri Telegram") e premi <b>Avvia</b></div>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-num">2</div>
+        <div class="step-body">
+          <div class="step-title">Invia un messaggio</div>
+          <div class="step-desc">Scrivi <code>/start</code> oppure un messaggio qualsiasi, es. "ciao"</div>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-num">3</div>
+        <div class="step-body">
+          <div class="step-title">Torna qui e collega</div>
+          <div class="step-desc">Premi il pulsante qui sotto: verifichiamo il tuo ultimo messaggio e colleghiamo l'account</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="gate-status" id="gate-status">
+      <span>⚠️ Telegram non è ancora collegato</span>
+    </div>
+
+    <button id="gate-connect-btn" onclick="detectAndStartTelegram()">📡 Collega Telegram</button>
+    <div class="gate-hint">Premendo "Collega", Cecchino Pro verifica il tuo ultimo messaggio al bot e associa il tuo account Telegram all'app.</div>
+
     <div class="err" id="gate-err"></div>
+
+    <details class="gate-fallback">
+      <summary>⚙️ Hai problemi a collegare Telegram?</summary>
+      <p class="dim" style="font-size:12px;margin:6px 0">In alternativa puoi inserire manualmente il Chat ID (scrivi a <b>@userinfobot</b> su Telegram: risponde subito con il tuo ID).</p>
+      <input id="gate-telegram" type="text" placeholder="es. 123456789" autocomplete="off" inputmode="numeric">
+      <button class="secondary" onclick="saveGateTelegram()">Collega con Chat ID</button>
+    </details>
   </div>
 </div>
 
@@ -3986,12 +4171,21 @@ nav.bottom button.active { color: var(--blue); }
     <h2>⚙️ Impostazioni</h2>
     <div class="dim" style="font-size:12px">Canale principale per gli alert BUY/SELL</div>
 
-    <label>Telegram — chat ID</label>
-    <input id="set-telegram" type="text" placeholder="es. 123456789">
-    <div class="row-btns">
-      <button class="secondary" style="flex:1" onclick="detectTelegramChatId()">📡 Rileva automaticamente</button>
+    <div id="settings-telegram-connected" class="gate-status connected" style="display:none;margin-top:14px">
+      <span id="settings-telegram-status-text">✓ Telegram collegato</span>
     </div>
-    <div class="hint">Prima scrivi un messaggio qualsiasi al tuo bot su Telegram (es. "ciao"), poi premi "Rileva automaticamente" — trova da solo il tuo chat ID. Se il bot non è ancora configurato lato server, vedi il README per crearlo con @BotFather.</div>
+    <div id="settings-telegram-form">
+      <label>Telegram — chat ID</label>
+      <input id="set-telegram" type="text" placeholder="es. 123456789">
+      <div class="row-btns">
+        <button class="secondary" style="flex:1" onclick="detectTelegramChatId()">📡 Rileva automaticamente</button>
+      </div>
+      <div class="hint">Scrivi prima un messaggio qualsiasi al bot su Telegram (es. "ciao"), poi premi "Rileva automaticamente" — trova da solo il tuo chat ID.</div>
+    </div>
+    <div class="row-btns" id="settings-telegram-actions" style="display:none">
+      <button class="secondary" style="flex:1" onclick="showTelegramForm()">🔄 Cambia</button>
+      <button class="secondary" style="flex:1" onclick="testTelegram()">📨 Testa Telegram</button>
+    </div>
 
     <label>Email (opzionale, in più a Telegram)</label>
     <input id="set-email" type="email" placeholder="lascia vuoto per non usarla">
@@ -4178,12 +4372,69 @@ nav.bottom button.active { color: var(--blue); }
 let CURRENT_EMAIL = {{ alert_email|tojson }};
 let CURRENT_TELEGRAM = {{ telegram_chat_id|tojson }};
 
+const TELEGRAM_ERROR_MESSAGES = {
+  not_found: 'Non riesco ancora a trovare un messaggio del bot. Apri il bot su Telegram, premi Avvia e inviagli /start. Poi torna qui e riprova.',
+  not_configured: 'Il bot Telegram non è ancora configurato su questo sito. Contatta chi gestisce Cecchino Pro.',
+  network: 'Non riesco a contattare Telegram in questo momento. Controlla la connessione e riprova tra qualche secondo.',
+  generic: 'Qualcosa non ha funzionato. Riprova tra qualche secondo.',
+};
+
+function humanizeTelegramError(data, status) {
+  const raw = (data && data.error) || '';
+  console.error('Telegram error:', status, raw); // dettaglio tecnico solo in console, mai mostrato
+  if (status === 404 || /nessun messaggio/i.test(raw)) return TELEGRAM_ERROR_MESSAGES.not_found;
+  if (status === 400 && /non configurato/i.test(raw)) return TELEGRAM_ERROR_MESSAGES.not_configured;
+  if (status >= 500 || /rete/i.test(raw)) return TELEGRAM_ERROR_MESSAGES.network;
+  return TELEGRAM_ERROR_MESSAGES.generic;
+}
+
+async function loadBotInfo() {
+  const nameEl = document.getElementById('gate-bot-name');
+  const userEl = document.getElementById('gate-bot-username');
+  const linkEl = document.getElementById('gate-bot-link');
+  try {
+    const res = await fetch('/api/settings');
+    const data = await res.json();
+    if (data.telegram_bot_username) {
+      nameEl.textContent = data.telegram_bot_name || 'Bot Telegram';
+      userEl.textContent = '@' + data.telegram_bot_username;
+      linkEl.href = `https://t.me/${data.telegram_bot_username}`;
+    } else if (!data.telegram_bot_configured) {
+      nameEl.textContent = 'Bot non ancora configurato';
+      userEl.textContent = 'Contatta chi gestisce il sito';
+    } else {
+      userEl.textContent = 'Apri Telegram e cerca il tuo bot';
+    }
+  } catch (e) { /* la card resta col placeholder, non blocca il resto */ }
+}
+
+function setGateStatus(state, text) {
+  const el = document.getElementById('gate-status');
+  el.className = 'gate-status' + (state ? ' ' + state : '');
+  el.innerHTML = state === 'checking' ? `<span class="spin"></span><span>${text}</span>` : `<span>${text}</span>`;
+}
+
+function setGateError(msg) {
+  const el = document.getElementById('gate-err');
+  el.textContent = msg || '';
+  el.classList.toggle('show', !!msg);
+}
+
+function setGateBusy(busy) {
+  const btn = document.getElementById('gate-connect-btn');
+  btn.disabled = busy;
+  btn.textContent = busy ? 'Controllo Telegram…' : '📡 Collega Telegram';
+}
+
 function refreshEmailUI() {
   const gate = document.getElementById('email-gate');
   const display = document.getElementById('email-display');
   if (!CURRENT_TELEGRAM) {
     gate.style.display = 'flex';
+    setGateStatus('', '⚠️ Telegram non è ancora collegato');
+    setGateError('');
     display.textContent = '';
+    loadBotInfo();
   } else {
     gate.style.display = 'none';
     display.textContent = '🔔 Telegram collegato' + (CURRENT_EMAIL ? ' + ✉️' : '');
@@ -4191,42 +4442,74 @@ function refreshEmailUI() {
 }
 
 async function saveTelegramChatId(chatId) {
-  const errEl = document.getElementById('gate-err');
-  const res = await fetch('/api/settings/telegram', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({chat_id: chatId}),
-  });
-  const data = await res.json();
-  if (!res.ok) {
-    errEl.textContent = data.error || 'Errore';
-    return;
+  setGateStatus('checking', 'Controllo Telegram…');
+  setGateBusy(true);
+  setGateError('');
+  try {
+    const res = await fetch('/api/settings/telegram', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({chat_id: chatId}),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      setGateStatus('', '⚠️ Telegram non è ancora collegato');
+      setGateError(humanizeTelegramError(data, res.status));
+      return;
+    }
+    CURRENT_TELEGRAM = data.telegram_chat_id;
+    setGateStatus('connected', '✓ Telegram collegato! Riceverai qui gli avvisi di Cecchino Pro.');
+    setTimeout(refreshEmailUI, 1100);
+  } catch (e) {
+    setGateStatus('', '⚠️ Telegram non è ancora collegato');
+    setGateError(TELEGRAM_ERROR_MESSAGES.network);
+  } finally {
+    setGateBusy(false);
   }
-  CURRENT_TELEGRAM = data.telegram_chat_id;
-  refreshEmailUI();
 }
 
 async function detectAndStartTelegram() {
-  const errEl = document.getElementById('gate-err');
-  errEl.textContent = '';
-  const res = await fetch('/api/settings/telegram/detect', { method: 'POST' });
-  const data = await res.json();
-  if (!res.ok) {
-    errEl.textContent = data.error || 'Errore';
-    return;
+  setGateError('');
+  setGateBusy(true);
+  setGateStatus('checking', 'Controllo Telegram…');
+  try {
+    const res = await fetch('/api/settings/telegram/detect', { method: 'POST' });
+    const data = await res.json();
+    if (!res.ok) {
+      setGateStatus('', '⚠️ Telegram non è ancora collegato');
+      setGateError(humanizeTelegramError(data, res.status));
+      setGateBusy(false);
+      return;
+    }
+    await saveTelegramChatId(data.telegram_chat_id);
+  } catch (e) {
+    setGateStatus('', '⚠️ Telegram non è ancora collegato');
+    setGateError(TELEGRAM_ERROR_MESSAGES.network);
+    setGateBusy(false);
   }
-  await saveTelegramChatId(data.telegram_chat_id);
 }
 
 async function saveGateTelegram() {
   const chatId = document.getElementById('gate-telegram').value.trim();
-  const errEl = document.getElementById('gate-err');
-  errEl.textContent = '';
   if (!chatId) {
-    errEl.textContent = 'Inserisci un chat ID, oppure scrivi al bot e premi "Ho scritto al bot"';
+    setGateError('Inserisci un Chat ID, oppure usa "Collega Telegram" sopra dopo aver scritto al bot.');
     return;
   }
   await saveTelegramChatId(chatId);
+}
+
+function showTelegramForm() {
+  document.getElementById('settings-telegram-connected').style.display = 'none';
+  document.getElementById('settings-telegram-form').style.display = 'block';
+  document.getElementById('settings-telegram-actions').style.display = 'none';
+}
+
+function showTelegramConnected(chatId) {
+  const masked = chatId.length > 3 ? '•••••' + chatId.slice(-3) : chatId;
+  document.getElementById('settings-telegram-status-text').textContent = `✓ Telegram collegato — Chat ID: ${masked}`;
+  document.getElementById('settings-telegram-connected').style.display = 'flex';
+  document.getElementById('settings-telegram-form').style.display = 'none';
+  document.getElementById('settings-telegram-actions').style.display = 'flex';
 }
 
 async function openSettings() {
@@ -4237,7 +4520,9 @@ async function openSettings() {
     const res = await fetch('/api/settings');
     const data = await res.json();
     document.getElementById('set-telegram').value = data.telegram_chat_id || '';
-  } catch (e) { /* ignora, campo resta vuoto */ }
+    if (data.telegram_chat_id) showTelegramConnected(data.telegram_chat_id);
+    else showTelegramForm();
+  } catch (e) { showTelegramForm(); }
   document.getElementById('settings-modal').style.display = 'flex';
 }
 
@@ -4259,14 +4544,18 @@ async function saveSettings() {
     body: JSON.stringify({email}),
   });
   const data = await res.json();
-  if (!res.ok) { errEl.textContent = data.error || 'Errore'; return; }
+  if (!res.ok) { errEl.textContent = data.error || 'Email non valida.'; return; }
   CURRENT_EMAIL = data.email;
 
-  await fetch('/api/settings/telegram', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({chat_id: telegram}),
-  });
+  if (telegram) {
+    await fetch('/api/settings/telegram', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({chat_id: telegram}),
+    });
+    CURRENT_TELEGRAM = telegram;
+    showTelegramConnected(telegram);
+  }
 
   refreshEmailUI();
   okEl.textContent = 'Salvato ✓';
@@ -4279,9 +4568,32 @@ async function detectTelegramChatId() {
   okEl.textContent = '';
   const res = await fetch('/api/settings/telegram/detect', { method: 'POST' });
   const data = await res.json();
-  if (!res.ok) { errEl.textContent = data.error || 'Errore'; return; }
+  if (!res.ok) { errEl.textContent = humanizeTelegramError(data, res.status); return; }
   document.getElementById('set-telegram').value = data.telegram_chat_id;
-  okEl.textContent = `Trovato: ${data.name || data.telegram_chat_id} ✓ (premi Salva)`;
+  CURRENT_TELEGRAM = data.telegram_chat_id;
+  showTelegramConnected(data.telegram_chat_id);
+  okEl.textContent = `Trovato: ${data.name || data.telegram_chat_id} ✓`;
+  refreshEmailUI();
+}
+
+async function testTelegram() {
+  const errEl = document.getElementById('settings-err');
+  const okEl = document.getElementById('settings-ok');
+  errEl.textContent = '';
+  okEl.textContent = 'Invio in corso…';
+  try {
+    const res = await fetch('/api/settings/telegram/test', { method: 'POST' });
+    const data = await res.json();
+    if (!res.ok) {
+      okEl.textContent = '';
+      errEl.textContent = 'Non sono riuscito a mandare il messaggio di prova. Controlla di aver scritto al bot di recente.';
+      return;
+    }
+    okEl.textContent = 'Messaggio di prova inviato ✓ — controlla Telegram';
+  } catch (e) {
+    okEl.textContent = '';
+    errEl.textContent = 'Errore di rete durante l\'invio di prova.';
+  }
 }
 
 function triggerPhotoImport() {

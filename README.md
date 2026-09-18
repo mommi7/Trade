@@ -44,11 +44,19 @@ il sito ogni volta.
    messaggio che riceve si registra da solo come proprietario — nessun
    altro può usarlo dopo, il bot ignora silenziosamente chiunque non sia
    te. Ti risponde "✅ Configurato!".
-4. **Apri il sito**: la prima schermata chiede di collegare Telegram — se
-   hai già scritto al bot basta premere "📡 Ho scritto al bot — collega"
-   (trova da solo il tuo chat ID), altrimenti puoi incollarlo a mano. Da
+4. **Apri il sito**: la prima schermata mostra il tuo bot (nome + @username,
+   letti in automatico da Telegram) con un pulsante "Apri Telegram" che
+   porta dritto alla chat, e 3 passaggi numerati. Se hai già scritto al
+   bot basta premere "📡 Collega Telegram" (trova da solo il tuo chat ID,
+   con spinner e messaggi di stato durante il controllo); se qualcosa va
+   storto ti spiega cosa fare in linguaggio semplice, mai un codice errore
+   tecnico. In fondo, una sezione a scomparsa "Hai problemi a collegare
+   Telegram?" offre l'inserimento manuale del Chat ID come alternativa. Da
    quel momento tutti gli alert (BUY/SELL, stop loss, opportunità, verdetto
-   giornaliero, screener) arrivano lì — nessuna email richiesta.
+   giornaliero, screener) arrivano lì — nessuna email richiesta. Dalle
+   Impostazioni ⚙️ puoi in ogni momento vedere lo stato del collegamento
+   (Chat ID mascherato) e mandarti un messaggio di prova con "📨 Testa
+   Telegram".
 
 **L'email è facoltativa**, non più il canale principale: se la vuoi
 comunque come backup, impostala dalle Impostazioni ⚙️ (genera una
