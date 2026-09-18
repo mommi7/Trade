@@ -2588,7 +2588,17 @@ def _finalize_decision(ticker, price, layers, data_sources, decision_override=No
             codes.append("DATA-UNAVAILABLE-ALL-LAYERS")
         else:
             final_score = round(weighted_sum / total_weight, 1)
-            if final_score >= config.DECISION_BUY_THRESHOLD:
+            # Con troppi livelli mancanti, ridistribuire il peso solo su
+            # quelli disponibili può gonfiare artificialmente il punteggio
+            # (es. mancano fundamental+bottleneck, gli unici due livelli che
+            # avrebbero potuto segnalare un problema aziendale, e il
+            # punteggio sale invece di restare prudente). Sotto la soglia di
+            # copertura, la decisione resta HOLD qualunque sia il punteggio:
+            # mai un BUY/SELL basato su dati incompleti.
+            if total_weight < config.DECISION_MIN_WEIGHT_COVERAGE:
+                decision = "HOLD"
+                codes.append(f"DATA-COVERAGE-LOW-{round(total_weight * 100)}PCT")
+            elif final_score >= config.DECISION_BUY_THRESHOLD:
                 decision = "BUY"
             elif final_score <= config.DECISION_SELL_THRESHOLD:
                 decision = "SELL"
@@ -4790,6 +4800,10 @@ async function loadDecision(ticker) {
       <div class="metric"><div class="val">${v != null ? Math.round(v) : '—'}</div><div class="lbl">${k}</div></div>
     `).join('') : '';
     const codes = (d.reason_codes || []).map(c => `<div>• ${c}</div>`).join('') || '<div class="dim">Nessun codice motivazione</div>';
+    const lowCoverage = (d.reason_codes || []).some(c => c.startsWith('DATA-COVERAGE-LOW'));
+    const coverageNote = lowCoverage
+      ? `<div style="margin-top:8px;padding:8px;border-radius:8px;background:rgba(234,179,8,0.12);border:1px solid rgba(234,179,8,0.3);font-size:12px">⚠️ Troppi dati mancanti (vedi "—" sopra) per fidarsi di un BUY/SELL: la decisione resta HOLD per prudenza, qualunque fosse il punteggio calcolato solo sui livelli disponibili.</div>`
+      : '';
     const transition = d.previous_decision ? `${d.previous_decision} → ${d.decision}` : d.decision;
     el.innerHTML = `
       <div class="card">
@@ -4797,6 +4811,7 @@ async function loadDecision(ticker) {
           <span style="color:${decisionColor(d.decision)};font-weight:700">${transition}</span></div>
         <div class="metrics" style="margin-top:8px">${scoreLine}${layers}</div>
         <div class="reasons" style="margin-top:8px">${codes}</div>
+        ${coverageNote}
         <div class="dim" style="font-size:11px;margin-top:8px">Filter version: ${d.filter_version} — nessuna AI, formula fissa e versionata.</div>
       </div>`;
   } catch (e) {

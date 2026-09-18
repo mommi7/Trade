@@ -349,6 +349,14 @@ DECISION_WEIGHTS = {"technical": 0.35, "fundamental": 0.30, "bottleneck": 0.20, 
 DECISION_BUY_THRESHOLD = 65.0
 DECISION_SELL_THRESHOLD = 35.0
 
+# Copertura minima del peso totale (somma dei pesi dei livelli disponibili
+# su 1.0) sotto la quale la decisione resta HOLD anche se il punteggio
+# ricalcolato solo sui livelli disponibili suggerirebbe BUY/SELL. Evita che
+# dati mancanti proprio nei livelli più critici (fundamental+bottleneck,
+# 0.50 di peso insieme) gonfino artificialmente il punteggio invece di
+# renderlo più prudente.
+DECISION_MIN_WEIGHT_COVERAGE = 0.65
+
 # Non ricalcolare il Decision Engine per lo stesso ticker più spesso di
 # così, anche se il tick automatico gira ogni 10 minuti: i dati (prezzo
 # escluso, già aggiornato altrove) non cambiano così in fretta, e i
