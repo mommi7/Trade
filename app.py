@@ -2975,19 +2975,17 @@ def monitor_loop():
     Su hosting cloud gratuito che va in sleep, usa /api/cron/tick invece."""
     time.sleep(10)  # Attende l'avvio di Flask
     while True:
-        try:
-            refresh_all_portfolio()
-            check_watch_levels()
-            run_market_screener()
-            generate_daily_verdict()
-            maybe_run_weekly_screener()
-            recheck_bottleneck_decisions()
-            run_decision_engine_for_portfolio()
-            backfill_decision_outcomes()
-        except Exception as e:
-            print(f"Errore monitor (riprova in 5 min): {e}")
-            time.sleep(300)
-            continue
+        for name, func in [
+            ("refresh_all_portfolio", refresh_all_portfolio),
+            ("check_watch_levels", check_watch_levels),
+            ("run_market_screener", run_market_screener),
+            ("generate_daily_verdict", generate_daily_verdict),
+            ("maybe_run_weekly_screener", maybe_run_weekly_screener),
+            ("recheck_bottleneck_decisions", recheck_bottleneck_decisions),
+            ("run_decision_engine_for_portfolio", run_decision_engine_for_portfolio),
+            ("backfill_decision_outcomes", backfill_decision_outcomes),
+        ]:
+            _run_tick_step(name, func)
         time.sleep(3600)
 
 
@@ -3163,19 +3161,35 @@ def start_background_monitor():
 # --------------------------------------------------------------------------
 # API - Cron esterno (GitHub Actions o altro, gratuito, per il tick orario)
 # --------------------------------------------------------------------------
+def _run_tick_step(name, func):
+    """Isola ogni fase del tick: se una fase fallisce (provider offline,
+    bug non ancora scoperto, rate limit), le altre girano comunque e il
+    tick torna sempre 200 — altrimenti un solo errore blocca tutto il
+    risveglio automatico del sito (esattamente il sintomo che ha causato
+    l'HTTP 500 su Render: un errore in un'unica fase abbatteva l'intero
+    /api/cron/tick)."""
+    try:
+        func()
+    except Exception as e:
+        print(f"Errore nello step '{name}' del tick (continuo con gli altri): {e}")
+
+
 @app.route("/api/cron/tick", methods=["POST"])
 def api_cron_tick():
     secret = request.headers.get("X-Cron-Secret", "")
     if not config.CRON_SECRET or secret != config.CRON_SECRET:
         return jsonify({"error": "unauthorized"}), 401
-    refresh_all_portfolio()
-    check_watch_levels()
-    run_market_screener()
-    generate_daily_verdict()
-    maybe_run_weekly_screener()
-    recheck_bottleneck_decisions()
-    run_decision_engine_for_portfolio()
-    backfill_decision_outcomes()
+    for name, func in [
+        ("refresh_all_portfolio", refresh_all_portfolio),
+        ("check_watch_levels", check_watch_levels),
+        ("run_market_screener", run_market_screener),
+        ("generate_daily_verdict", generate_daily_verdict),
+        ("maybe_run_weekly_screener", maybe_run_weekly_screener),
+        ("recheck_bottleneck_decisions", recheck_bottleneck_decisions),
+        ("run_decision_engine_for_portfolio", run_decision_engine_for_portfolio),
+        ("backfill_decision_outcomes", backfill_decision_outcomes),
+    ]:
+        _run_tick_step(name, func)
     return jsonify({"ok": True})
 
 
