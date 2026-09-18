@@ -260,8 +260,13 @@ github.com → foto profilo in alto a destra → **Settings** →
      vedi nota sotto) → mai BUY forte, solo WATCH.
   3. **No vendita da rumore**: un titolo posseduto non genera mai SELL per
      un semplice calo di prezzo. Serve un evento reale confermato (miss,
-     guidance tagliata, downgrade) nelle notizie delle ultime 48h — best
-     effort via Gemini se configurato, altrimenti resta sempre HOLD.
+     guidance tagliata, downgrade) nelle notizie delle ultime 48h — se
+     `GEMINI_API_KEY` è configurata usa l'AI per capire il contesto, **se
+     non lo è (zero AI) usa un controllo a parole chiave deterministico**
+     (`config.NEWS_BREAK_KEYWORDS`) sugli stessi titoli di notizie: stesso
+     input, stesso output sempre, gratuito, ma meno preciso di un'AI —
+     può generare falsi positivi/negativi. Se non trova nulla in nessuno
+     dei due casi, resta HOLD (scelta sicura di default).
   4. **Concentrazione per portafoglio**: alert se un settore supera il
      40% per Mohamed o per Micaela separatamente (vedi owner più sotto).
   5. **JNJ mai in SELL**: è l'ancora difensiva, esclusa a prescindere.
@@ -377,6 +382,28 @@ condiviso).
      prima: il commento AI è solo un extra facoltativo, non governa il
      segnale BUY/HOLD/SELL (quello resta calcolato da RSI/medie
      mobili/52 settimane/volumi, sempre attivo).
+
+### Modalità "zero AI" (nessuna chiamata a Gemini, da nessuna parte)
+
+Se preferisci un'app interamente aritmetica/deterministica, senza alcuna
+dipendenza da un modello AI: **non impostare `GEMINI_API_KEY`** (o
+rimuovila se l'avevi messa su Render → Environment). Tutte e 4 le funzioni
+che la usano sono già scritte per non fare nulla senza quella chiave,
+niente altro da toccare:
+- **Commento AI sopra i segnali**: semplicemente non compare.
+- **Verdetto giornaliero AI**: la card mostra un errore invece del
+  giudizio discorsivo (resta comunque tutto il resto: Scanner, Portafoglio,
+  Livelli, Settimanale e **Bottleneck Filter sono già 100% aritmetici**,
+  zero AI, non serve questa chiave per nessuno dei due).
+- **Import portafoglio da foto**: non disponibile senza AI (leggere uno
+  screenshot richiede per forza un modello visivo) — le posizioni vanno
+  inserite a mano dal form Portafoglio.
+- **Verifica notizie per il SELL nello Settimanale (regola 3)**: passa in
+  automatico dal controllo AI a un controllo a **parole chiave**
+  deterministico e gratuito (`config.NEWS_BREAK_KEYWORDS`, modificabile),
+  sugli stessi titoli di notizie letti da Yahoo Finance — stesso
+  meccanismo, meno intelligente di un'AI che legge il contesto, ma
+  sempre uguale e senza dipendenze esterne a pagamento.
 - Le soglie di acquisto/vendita **sono già automatiche** e non richiedono
   di inserire prezzi a mano: i campi nel form Portafoglio sono solo un
   avviso extra facoltativo a un prezzo preciso che scegli tu.

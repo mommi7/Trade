@@ -269,3 +269,24 @@ DEFENSIVE_SECTORS = {"Difensivo", "Healthcare", "Salute", "Beni di consumo prima
 # Cache locale delle fondamentali (24h) per non saturare Yahoo durante una
 # scansione dell'intero universo.
 BOTTLENECK_CACHE_TTL_SECONDS = 24 * 3600
+
+# --------------------------------------------------------------------------
+# Verifica notizie senza AI (usata al posto di Gemini quando GEMINI_API_KEY
+# non è impostata — vedi check_recent_event in app.py). Confronto letterale,
+# case-insensitive, sul titolo della notizia: se una di queste frasi compare,
+# il titolo posseduto passa da HOLD a SELL (regola 3 dello screener
+# settimanale). È deterministico e gratuito, ma più grezzo di un'AI che
+# legge il contesto — può generare falsi positivi (una frase che cita
+# "lawsuit" senza riguardare l'azienda) o falsi negativi (un evento reale
+# descritto con parole diverse da queste). Modifica pure questa lista.
+NEWS_BREAK_KEYWORDS = [
+    "guidance cut", "cuts guidance", "guidance tagliata", "lowers guidance",
+    "misses estimates", "missed estimates", "earnings miss", "profit warning",
+    "downgrade", "downgraded", "declassato", "declassata",
+    "lawsuit", "causa legale", "class action", "investigation", "indagine",
+    "sec probe", "sec inquiry", "fraud", "frode",
+    "resigns", "resignation", "dimissioni", "steps down",
+    "recall", "richiamo", "data breach", "cyberattack",
+    "bankruptcy", "fallimento", "files for chapter 11", "delisting",
+    "slashes forecast", "cuts forecast",
+]

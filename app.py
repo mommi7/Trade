@@ -2053,24 +2053,19 @@ def in_screener_entry_zone(spec, price):
     return False
 
 
-def check_recent_event(ticker):
-    """Best-effort (regola 3): cerca le notizie più recenti su Yahoo e
-    chiede a Gemini se descrivono un evento reale di rottura tesi (miss,
-    guidance tagliata, downgrade multiplo) o solo rumore. Se manca
-    GEMINI_API_KEY, non si trovano notizie, o qualcosa fallisce, ritorna
-    None: nessun evento confermato, che blocca il SELL — la scelta sicura
-    richiesta esplicitamente dalla regola 3, non un'approssimazione pigra."""
-    if not config.GEMINI_API_KEY:
-        return None
+# Parole chiave (italiano + inglese) che indicano un possibile evento reale
+# di rottura tesi, usate quando GEMINI_API_KEY non è configurata (zero AI).
+# È un controllo deterministico e sempre uguale: meno preciso di un'AI che
+# legge il contesto (può dare falsi positivi su notizie generiche che
+# citano queste parole di sfuggita, o mancare eventi descritti diversamente),
+# ma gratuito e prevedibile. Lista in config.NEWS_BREAK_KEYWORDS, modificala
+# lì se vuoi affinarla.
+
+
+def _check_recent_event_ai(ticker, news):
+    """Percorso AI (Gemini): capisce il contesto delle notizie, non solo le
+    parole. Usato solo se GEMINI_API_KEY è configurata."""
     try:
-        _warm_yahoo_session()
-        url = "https://query1.finance.yahoo.com/v1/finance/search"
-        r = YAHOO_SESSION.get(url, params={"q": ticker, "quotesCount": 0, "newsCount": 5}, timeout=8)
-        if r.status_code != 200:
-            return None
-        news = r.json().get("news", [])
-        if not news:
-            return None
         headlines = "\n".join(f"- {n.get('title', '')}" for n in news[:5])
         prompt = (
             f"Notizie più recenti trovate per il titolo {ticker}:\n{headlines}\n\n"
@@ -2093,8 +2088,54 @@ def check_recent_event(ticker):
         parsed = json.loads(text)
         return parsed if parsed.get("is_break") else None
     except Exception as e:
-        print(f"Errore check_recent_event per {ticker}: {e}")
+        print(f"Errore check_recent_event (AI) per {ticker}: {e}")
         return None
+
+
+def _check_recent_event_keywords(news):
+    """Percorso deterministico (zero AI): stesso elenco di notizie, ogni
+    titolo confrontato con NEWS_BREAK_KEYWORDS. Stesso input, stesso
+    output, sempre — nessuna chiamata a modelli esterni."""
+    for n in news:
+        title = (n.get("title") or "")
+        title_l = title.lower()
+        for kw in config.NEWS_BREAK_KEYWORDS:
+            if kw in title_l:
+                return {"is_break": True, "description": title, "matched_keyword": kw}
+    return None
+
+
+def check_recent_event(ticker):
+    """Best-effort (regola 3): cerca le notizie più recenti su Yahoo delle
+    ultime 48h. Se GEMINI_API_KEY è configurata usa Gemini per capire il
+    contesto; altrimenti (zero AI) usa il controllo a parole chiave
+    NEWS_BREAK_KEYWORDS, deterministico e gratuito. Se non si trovano
+    notizie o qualcosa fallisce, ritorna None: nessun evento confermato,
+    che blocca il SELL — la scelta sicura richiesta esplicitamente dalla
+    regola 3, non un'approssimazione pigra."""
+    try:
+        _warm_yahoo_session()
+        url = "https://query1.finance.yahoo.com/v1/finance/search"
+        r = YAHOO_SESSION.get(url, params={"q": ticker, "quotesCount": 0, "newsCount": 5}, timeout=8)
+        if r.status_code != 200:
+            return None
+        news = r.json().get("news", [])
+        if not news:
+            return None
+    except Exception as e:
+        print(f"Ricerca notizie fallita per {ticker}: {e}")
+        return None
+
+    cutoff = time.time() - 48 * 3600
+    recent = [n for n in news if (n.get("providerPublishTime") or 0) >= cutoff]
+    if not recent:
+        # Se providerPublishTime manca dalla risposta, meglio valutare
+        # comunque i titoli trovati che scartarli in automatico.
+        recent = news
+
+    if config.GEMINI_API_KEY:
+        return _check_recent_event_ai(ticker, recent)
+    return _check_recent_event_keywords(recent)
 
 
 def compute_screener_signal(spec, analysis, recent_event=None):
