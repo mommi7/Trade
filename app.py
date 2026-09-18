@@ -159,6 +159,51 @@ def init_db():
             checked_12m INTEGER DEFAULT 0,
             created DATETIME DEFAULT CURRENT_TIMESTAMP
         );
+
+        CREATE TABLE IF NOT EXISTS news_events (
+            id INTEGER PRIMARY KEY,
+            ticker TEXT,
+            url TEXT UNIQUE,
+            title TEXT,
+            publisher TEXT,
+            event_type TEXT,
+            severity INTEGER,
+            confidence REAL,
+            published_at REAL,
+            logged_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS decisions (
+            id INTEGER PRIMARY KEY,
+            ticker TEXT,
+            ts DATETIME DEFAULT CURRENT_TIMESTAMP,
+            price REAL,
+            technical_json TEXT,
+            fundamental_json TEXT,
+            bottleneck_json TEXT,
+            news_json TEXT,
+            technical_score REAL,
+            fundamental_score REAL,
+            bottleneck_score REAL,
+            news_score REAL,
+            final_score REAL,
+            decision TEXT,
+            previous_decision TEXT,
+            changed INTEGER DEFAULT 0,
+            reason_codes TEXT,
+            filter_version TEXT,
+            data_sources TEXT,
+            price_3m REAL,
+            price_6m REAL,
+            price_12m REAL,
+            return_3m REAL,
+            return_6m REAL,
+            return_12m REAL,
+            checked_3m INTEGER DEFAULT 0,
+            checked_6m INTEGER DEFAULT 0,
+            checked_12m INTEGER DEFAULT 0,
+            outcome TEXT
+        );
         """
     )
     conn.commit()
@@ -1080,6 +1125,49 @@ def compute_bottleneck_accuracy():
     return {"per_filter": out, "suggestions": suggestions}
 
 
+def compute_decision_accuracy():
+    """Statistiche del Decision Engine: win rate e rendimento medio/mediano
+    per le decisioni BUY/SELL già ricontrollate a 3/6/12 mesi. sample_size
+    è sempre esplicito: sotto config.MIN_ACCURACY_SAMPLE_SIZE ritorna
+    insufficient_sample invece di una percentuale che darebbe un falso
+    senso di affidabilità."""
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM decisions WHERE decision IN ('BUY', 'SELL') "
+            "AND (checked_3m = 1 OR checked_6m = 1 OR checked_12m = 1)"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    by_decision = {"BUY": [], "SELL": []}
+    for row in rows:
+        for horizon in ("3m", "6m", "12m"):
+            ret = row[f"return_{horizon}"]
+            if ret is not None:
+                by_decision[row["decision"]].append(ret)
+
+    def stats_for(returns, decision):
+        n = len(returns)
+        if n < config.MIN_ACCURACY_SAMPLE_SIZE:
+            return {"sample_size": n, "insufficient_sample": True}
+        wins = sum(1 for r in returns if (r > 0 if decision == "BUY" else r < 0))
+        s = sorted(returns)
+        median = s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
+        return {
+            "sample_size": n, "insufficient_sample": False,
+            "win_rate_pct": round(wins / n * 100, 1),
+            "avg_return_pct": round(sum(returns) / n, 2),
+            "median_return_pct": round(median, 2),
+        }
+
+    return {
+        "buy": stats_for(by_decision["BUY"], "BUY"),
+        "sell": stats_for(by_decision["SELL"], "SELL"),
+        "min_sample_size": config.MIN_ACCURACY_SAMPLE_SIZE,
+    }
+
+
 # --------------------------------------------------------------------------
 # Cambio EUR/USD (per convertire i prezzi di mercato, quasi sempre in USD,
 # nei valori in € mostrati da Trade Republic durante l'import da foto)
@@ -1933,6 +2021,41 @@ def refresh_all_portfolio():
             print(f"Errore aggiornamento {row['ticker']}: {e}")
 
 
+def run_decision_engine_for_portfolio():
+    """Applica il Decision Engine ad ogni ticker tracciato (tabella
+    tickers, active=1). Non ricalcola più spesso di
+    config.DECISION_ENGINE_MIN_INTERVAL_MINUTES per ticker, anche se questa
+    funzione viene chiamata ogni 10 minuti dal tick: evita di interrogare
+    inutilmente i provider quando i dati non possono essere cambiati."""
+    conn = get_db()
+    try:
+        rows = conn.execute("SELECT ticker FROM tickers WHERE active = 1").fetchall()
+    finally:
+        conn.close()
+
+    for row in rows:
+        ticker = row["ticker"]
+        conn = get_db()
+        try:
+            last = conn.execute(
+                "SELECT ts FROM decisions WHERE ticker = ? ORDER BY ts DESC LIMIT 1", (ticker,)
+            ).fetchone()
+        finally:
+            conn.close()
+        if last:
+            try:
+                last_ts = datetime.strptime(last["ts"].split(".")[0], "%Y-%m-%d %H:%M:%S")
+                age_minutes = (datetime.now() - last_ts).total_seconds() / 60
+                if age_minutes < config.DECISION_ENGINE_MIN_INTERVAL_MINUTES:
+                    continue
+            except (ValueError, TypeError):
+                pass
+        try:
+            evaluate_decision(ticker)
+        except Exception as e:
+            print(f"Errore Decision Engine per {ticker}: {e}")
+
+
 def notify_opportunities(results):
     subject = f"💡 CECCHINO: {len(results)} opportunità sul mercato oggi"
     blocks = []
@@ -2055,11 +2178,138 @@ def in_screener_entry_zone(spec, price):
 
 # Parole chiave (italiano + inglese) che indicano un possibile evento reale
 # di rottura tesi, usate quando GEMINI_API_KEY non è configurata (zero AI).
-# È un controllo deterministico e sempre uguale: meno preciso di un'AI che
-# legge il contesto (può dare falsi positivi su notizie generiche che
-# citano queste parole di sfuggita, o mancare eventi descritti diversamente),
-# ma gratuito e prevedibile. Lista in config.NEWS_BREAK_KEYWORDS, modificala
-# lì se vuoi affinarla.
+# Motore notizie deterministico (zero AI): NEWS_RULES in config.py associa
+# ogni tipo di evento a una severità 0-10 fissa e a un elenco di parole
+# chiave. Più preciso di un semplice sì/no: restituisce severità e
+# confidenza calcolate, non un giudizio testuale generato da un modello.
+
+
+def _fetch_recent_news(ticker, window_hours=48):
+    """Notizie Yahoo per il ticker, filtrate alle ultime `window_hours`.
+    Fonte unica gratuita: se fallisce o non trova nulla, torna lista vuota
+    (mai un'eccezione) — un provider assente è "nessuna notizia disponibile",
+    non un errore che blocca il resto della decisione."""
+    try:
+        _warm_yahoo_session()
+        url = "https://query1.finance.yahoo.com/v1/finance/search"
+        r = YAHOO_SESSION.get(url, params={"q": ticker, "quotesCount": 0, "newsCount": 8}, timeout=8)
+        if r.status_code != 200:
+            return []
+        news = r.json().get("news", [])
+    except Exception as e:
+        print(f"Ricerca notizie fallita per {ticker}: {e}")
+        return []
+
+    cutoff = time.time() - window_hours * 3600
+    recent = [n for n in news if (n.get("providerPublishTime") or 0) >= cutoff]
+    return recent if recent else news  # providerPublishTime assente: valuta comunque i titoli trovati
+
+
+def _has_negation_before(title_l, kw_pos):
+    """Regola 6 del motore notizie: una negazione entro le 4 parole prima
+    della frase chiave ("denies fraud allegations", "rules out bankruptcy")
+    riduce la confidenza — non è la stessa cosa di un evento confermato."""
+    prefix = title_l[:kw_pos]
+    prefix_words = prefix.split()[-4:]
+    return any(neg.strip() in " ".join(prefix_words) for neg in config.NEWS_NEGATION_WORDS)
+
+
+def classify_news_item(title, publisher=None):
+    """Confronta un titolo con config.NEWS_RULES. Ritorna il match di
+    severità più alta trovato (un titolo può citare più regole), con
+    confidenza calcolata deterministicamente da: affidabilità della fonte,
+    numero di regole corrispondenti, presenza di negazioni. Nessuna
+    chiamata esterna, nessuna AI: stesso input, stesso output sempre."""
+    title_l = (title or "").lower()
+    matches = []
+    for event_type, rule in config.NEWS_RULES.items():
+        for kw in rule["keywords"]:
+            pos = title_l.find(kw)
+            if pos == -1:
+                continue
+            negated = _has_negation_before(title_l, pos)
+            matches.append({
+                "event_type": event_type,
+                "severity": rule["severity"],
+                "keyword": kw,
+                "negated": negated,
+            })
+            break  # una keyword per regola basta, evita doppi conteggi sulla stessa regola
+
+    confirmed = [m for m in matches if not m["negated"]]
+    if not confirmed:
+        return None
+
+    best = max(confirmed, key=lambda m: m["severity"])
+    source_reliable = publisher in config.NEWS_RELIABLE_PUBLISHERS
+    confidence = 0.55 if not source_reliable else 0.8
+    confidence += min(0.15, 0.05 * (len(confirmed) - 1))  # più regole confermate, più confidenza
+    if any(m["negated"] for m in matches) and len(confirmed) == len(matches):
+        pass  # nessuna negazione tra i match confermati, nulla da penalizzare
+    confidence = round(min(confidence, 1.0), 2)
+
+    return {
+        "event_type": best["event_type"],
+        "severity": best["severity"],
+        "confidence": confidence,
+        "matched_rules": sorted({m["event_type"] for m in confirmed}),
+    }
+
+
+def _news_severity_label(severity):
+    for threshold, label in config.NEWS_SEVERITY_LABELS:
+        if severity >= threshold:
+            return label
+    return "informational"
+
+
+def assess_news(ticker):
+    """Funzione canonica del News Engine: recupera le notizie recenti,
+    classifica ogni titolo con classify_news_item, e ritorna l'evento di
+    severità più alta trovato (event_type, severity, confidence, source,
+    published_at, matched_rules, headline, url) — o severity 0 se nessun
+    evento rilevante, MAI un input mancante silenzioso. Logga ogni evento
+    nuovo (per url) in news_events per lo storico News/Eventi."""
+    items = _fetch_recent_news(ticker)
+    best = None
+    for n in items:
+        title = n.get("title") or ""
+        publisher = n.get("publisher")
+        classified = classify_news_item(title, publisher)
+        if not classified:
+            continue
+        event = {
+            **classified,
+            "source": publisher,
+            "published_at": n.get("providerPublishTime"),
+            "headline": title,
+            "url": n.get("link"),
+        }
+        if best is None or event["severity"] > best["severity"]:
+            best = event
+
+    if best is None:
+        return {
+            "event_type": None, "severity": 0, "confidence": 1.0, "source": None,
+            "published_at": None, "matched_rules": [], "headline": None, "url": None,
+            "severity_label": "informational",
+        }
+
+    best["severity_label"] = _news_severity_label(best["severity"])
+    if best.get("url"):
+        conn = get_db()
+        try:
+            conn.execute(
+                "INSERT OR IGNORE INTO news_events "
+                "(ticker, url, title, publisher, event_type, severity, confidence, published_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (ticker, best["url"], best["headline"], best["source"], best["event_type"],
+                 best["severity"], best["confidence"], best["published_at"]),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    return best
 
 
 def _check_recent_event_ai(ticker, news):
@@ -2092,50 +2342,302 @@ def _check_recent_event_ai(ticker, news):
         return None
 
 
-def _check_recent_event_keywords(news):
-    """Percorso deterministico (zero AI): stesso elenco di notizie, ogni
-    titolo confrontato con NEWS_BREAK_KEYWORDS. Stesso input, stesso
-    output, sempre — nessuna chiamata a modelli esterni."""
-    for n in news:
-        title = (n.get("title") or "")
-        title_l = title.lower()
-        for kw in config.NEWS_BREAK_KEYWORDS:
-            if kw in title_l:
-                return {"is_break": True, "description": title, "matched_keyword": kw}
+def _check_recent_event_keywords(ticker):
+    """Percorso deterministico (zero AI) per la regola 3 dello Settimanale:
+    riusa assess_news e considera "evento di rottura tesi" solo la severità
+    "serious" o superiore (>=7 su 10) — allineato alla stessa soglia
+    prudente richiesta dalla regola 3 (mai SELL da rumore generico)."""
+    news = assess_news(ticker)
+    if news["severity"] >= 7:
+        return {"is_break": True, "description": news["headline"], "matched_keyword": news["event_type"]}
     return None
 
 
 def check_recent_event(ticker):
     """Best-effort (regola 3): cerca le notizie più recenti su Yahoo delle
     ultime 48h. Se GEMINI_API_KEY è configurata usa Gemini per capire il
-    contesto; altrimenti (zero AI) usa il controllo a parole chiave
-    NEWS_BREAK_KEYWORDS, deterministico e gratuito. Se non si trovano
-    notizie o qualcosa fallisce, ritorna None: nessun evento confermato,
-    che blocca il SELL — la scelta sicura richiesta esplicitamente dalla
-    regola 3, non un'approssimazione pigra."""
-    try:
-        _warm_yahoo_session()
-        url = "https://query1.finance.yahoo.com/v1/finance/search"
-        r = YAHOO_SESSION.get(url, params={"q": ticker, "quotesCount": 0, "newsCount": 5}, timeout=8)
-        if r.status_code != 200:
-            return None
-        news = r.json().get("news", [])
+    contesto; altrimenti (zero AI) usa il News Engine deterministico
+    (config.NEWS_RULES) tramite assess_news. Se non si trovano notizie o
+    qualcosa fallisce, ritorna None: nessun evento confermato, che blocca
+    il SELL — la scelta sicura richiesta esplicitamente dalla regola 3,
+    non un'approssimazione pigra."""
+    if config.GEMINI_API_KEY:
+        news = _fetch_recent_news(ticker)
         if not news:
             return None
-    except Exception as e:
-        print(f"Ricerca notizie fallita per {ticker}: {e}")
-        return None
+        return _check_recent_event_ai(ticker, news)
+    return _check_recent_event_keywords(ticker)
 
-    cutoff = time.time() - 48 * 3600
-    recent = [n for n in news if (n.get("providerPublishTime") or 0) >= cutoff]
-    if not recent:
-        # Se providerPublishTime manca dalla risposta, meglio valutare
-        # comunque i titoli trovati che scartarli in automatico.
-        recent = news
 
-    if config.GEMINI_API_KEY:
-        return _check_recent_event_ai(ticker, recent)
-    return _check_recent_event_keywords(recent)
+# --------------------------------------------------------------------------
+# Decision Engine (config.DECISION_ENGINE_VERSION) — unisce motore tecnico +
+# Motore A (fondamentale) + Motore B (bottleneck) + motore notizie in
+# un'unica decisione BUY/HOLD/SELL/DATA_UNAVAILABLE. Sempre deterministico:
+# nessuna chiamata AI, formula e soglie fisse e versionate in config.py.
+# Alert Telegram/mail solo quando la decisione CAMBIA rispetto all'ultima
+# registrata per quel ticker (mai un alert ripetuto a parità di stato).
+# --------------------------------------------------------------------------
+def _technical_reason_codes(result):
+    """Ricostruisce codici motivazione strutturati dalle stesse soglie già
+    usate in compute_signal, senza duplicarne la logica di scoring (che
+    resta lì, intoccata, per non rischiare di rompere Scanner/Portafoglio
+    che la usano da sempre)."""
+    codes = []
+    rsi, price = result.get("rsi"), result.get("price")
+    ma50, ma200 = result.get("ma50"), result.get("ma200")
+    dist_high52, day_chg = result.get("dist_high52"), result.get("day_chg")
+    vol_ratio = result.get("vol_ratio")
+
+    if rsi is not None:
+        if rsi < 30:
+            codes.append("T-RSI-OVERSOLD-STRONG")
+        elif rsi < 40:
+            codes.append("T-RSI-OVERSOLD")
+        elif rsi > 75:
+            codes.append("T-RSI-OVERBOUGHT-STRONG")
+        elif rsi > 65:
+            codes.append("T-RSI-OVERBOUGHT")
+    if price is not None and ma50 is not None:
+        codes.append("T-ABOVE-MA50" if price > ma50 else "T-BELOW-MA50")
+    if price is not None and ma200 is not None:
+        codes.append("T-ABOVE-MA200" if price > ma200 else "T-BELOW-MA200")
+    if dist_high52 is not None:
+        if dist_high52 < -25:
+            codes.append("T-DEEP-DISCOUNT-52W")
+        elif dist_high52 < -15:
+            codes.append("T-DISCOUNT-52W")
+        elif dist_high52 > -3:
+            codes.append("T-NEAR-52W-HIGH")
+    if day_chg is not None:
+        if day_chg > 12:
+            codes.append("T-SPIKE-UP")
+        elif day_chg < -10:
+            codes.append("T-DIP-DOWN")
+    if vol_ratio is not None and vol_ratio > 1.8 and day_chg is not None:
+        if day_chg > 2:
+            codes.append("T-VOLUME-CONFIRM-UP")
+        elif day_chg < -2:
+            codes.append("T-VOLUME-CONFIRM-DOWN")
+    return codes
+
+
+def _fundamental_score_from_engine_a(engine_a):
+    """0-100: quota di filtri Motore A passati sul totale valutabile (i
+    "missing" non contano né a favore né contro — dato non disponibile
+    non è una bocciatura, stessa regola del Bottleneck Filter)."""
+    statuses = [f["status"] for f in engine_a["filters"]]
+    evaluable = [s for s in statuses if s != "missing"]
+    if not evaluable:
+        return None, []
+    score = evaluable.count("pass") / len(evaluable) * 100
+    codes = [f"F-{f['key'].upper()}-FAIL" for f in engine_a["filters"] if f["status"] == "fail"]
+    return round(score, 1), codes
+
+
+def _bottleneck_score_from_engine_b(engine_b):
+    """0-100: il totale Motore B (0-50) riscalato. None se dati incompleti."""
+    if engine_b["total"] is None:
+        return None, []
+    return round(engine_b["total"] * 2, 1), [f"B-VERDICT-{engine_b['verdict']}"]
+
+
+def _news_score_from_assessment(news):
+    """0-100: severità*10. 0 = nessun evento rilevante trovato (non è un
+    dato mancante: assess_news controlla sempre, torna severità 0 se non
+    trova nulla di classificabile)."""
+    score = news["severity"] * 10
+    codes = [f"N-{news['event_type'].upper()}-SEV{news['severity']}"] if news["event_type"] else []
+    return score, codes
+
+
+def evaluate_decision(ticker):
+    """Calcola e registra la decisione unica per un ticker. Riusa
+    analyze_ticker (motore tecnico), analyze_bottleneck (Motore A+B) e
+    assess_news (motore notizie) — nessuna nuova chiamata di rete qui
+    dentro, solo aggregazione secondo la formula in config.DECISION_WEIGHTS."""
+    data_sources = {}
+
+    technical_result = analyze_ticker(ticker)
+    data_sources["price"] = "error" not in technical_result
+    if "error" in technical_result:
+        layers = {
+            "technical": {"score": None, "codes": [], "raw": technical_result},
+            "fundamental": {"score": None, "codes": [], "raw": None},
+            "bottleneck": {"score": None, "codes": [], "raw": None},
+            "news": {"score": None, "codes": [], "raw": None},
+        }
+        return _finalize_decision(ticker, None, layers, data_sources,
+                                   decision_override="DATA_UNAVAILABLE",
+                                   override_codes=["DATA-UNAVAILABLE-PRICE"])
+
+    price = technical_result["price"]
+    technical_layer = {
+        "score": (technical_result["score"] + 100) / 2,
+        "codes": _technical_reason_codes(technical_result),
+        "raw": {k: technical_result.get(k) for k in
+                ("rsi", "ma50", "ma200", "dist_high52", "dist_low52", "day_chg", "vol_ratio", "score", "signal")},
+    }
+
+    bottleneck_result = analyze_bottleneck(ticker)
+    data_sources["fundamentals"] = not bool(bottleneck_result.get("error"))
+    if bottleneck_result.get("error"):
+        fundamental_layer = {"score": None, "codes": [], "raw": None}
+        bottleneck_layer = {"score": None, "codes": [], "raw": None}
+    else:
+        f_score, f_codes = _fundamental_score_from_engine_a(bottleneck_result["engine_a"])
+        b_score, b_codes = _bottleneck_score_from_engine_b(bottleneck_result["engine_b"])
+        fundamental_layer = {"score": f_score, "codes": f_codes, "raw": bottleneck_result["engine_a"]}
+        bottleneck_layer = {"score": b_score, "codes": b_codes, "raw": bottleneck_result["engine_b"]}
+
+    news = assess_news(ticker)
+    data_sources["news"] = True  # assess_news non fallisce mai: severità 0 se non trova nulla
+    n_score, n_codes = _news_score_from_assessment(news)
+    news_layer = {"score": n_score, "codes": n_codes, "raw": news}
+
+    layers = {"technical": technical_layer, "fundamental": fundamental_layer,
+              "bottleneck": bottleneck_layer, "news": news_layer}
+    return _finalize_decision(ticker, price, layers, data_sources)
+
+
+def _finalize_decision(ticker, price, layers, data_sources, decision_override=None, override_codes=None):
+    conn = get_db()
+    try:
+        last = conn.execute(
+            "SELECT decision FROM decisions WHERE ticker = ? ORDER BY ts DESC LIMIT 1", (ticker,)
+        ).fetchone()
+    finally:
+        conn.close()
+    previous_decision = last["decision"] if last else None
+
+    codes = []
+    for layer in layers.values():
+        codes.extend(layer["codes"])
+
+    if decision_override:
+        decision, final_score = decision_override, None
+        codes = (override_codes or []) + codes
+    else:
+        weights = config.DECISION_WEIGHTS
+        total_weight = weighted_sum = 0.0
+        for name, layer in layers.items():
+            if layer["score"] is None:
+                continue
+            # Il layer "news" è un punteggio di RISCHIO (alto = notizia
+            # grave): va invertito per contribuire nella stessa direzione
+            # BUY-positiva degli altri tre layer.
+            contribution = (100 - layer["score"]) if name == "news" else layer["score"]
+            weighted_sum += contribution * weights[name]
+            total_weight += weights[name]
+        if total_weight <= 0:
+            decision, final_score = "DATA_UNAVAILABLE", None
+            codes.append("DATA-UNAVAILABLE-ALL-LAYERS")
+        else:
+            final_score = round(weighted_sum / total_weight, 1)
+            if final_score >= config.DECISION_BUY_THRESHOLD:
+                decision = "BUY"
+            elif final_score <= config.DECISION_SELL_THRESHOLD:
+                decision = "SELL"
+            else:
+                decision = "HOLD"
+
+    changed = previous_decision is not None and previous_decision != decision
+
+    conn = get_db()
+    try:
+        conn.execute(
+            "INSERT INTO decisions (ticker, price, technical_json, fundamental_json, bottleneck_json, "
+            "news_json, technical_score, fundamental_score, bottleneck_score, news_score, final_score, "
+            "decision, previous_decision, changed, reason_codes, filter_version, data_sources) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                ticker, price,
+                json.dumps(layers["technical"]["raw"]), json.dumps(layers["fundamental"]["raw"]),
+                json.dumps(layers["bottleneck"]["raw"]), json.dumps(layers["news"]["raw"]),
+                layers["technical"]["score"], layers["fundamental"]["score"],
+                layers["bottleneck"]["score"], layers["news"]["score"], final_score,
+                decision, previous_decision, int(changed),
+                json.dumps(codes), config.DECISION_ENGINE_VERSION, json.dumps(data_sources),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = {
+        "ticker": ticker, "price": price, "decision": decision, "previous_decision": previous_decision,
+        "changed": changed, "final_score": final_score, "reason_codes": codes,
+        "filter_version": config.DECISION_ENGINE_VERSION,
+        "layers": {k: v["score"] for k, v in layers.items()},
+        "data_sources": data_sources,
+    }
+    if changed:
+        notify_decision_change(result)
+    return result
+
+
+def notify_decision_change(result):
+    """Alert strutturato (MAI testo generativo), solo su cambio di
+    decisione rispetto all'ultima registrata — regola di transizione del
+    Decision Engine, niente spam a parità di stato."""
+    lines = [
+        "CECCHINO PRO", "",
+        result["ticker"],
+        f"Signal: {result['previous_decision']} → {result['decision']}", "",
+    ]
+    if result["final_score"] is not None:
+        lines += [f"Score: {result['final_score']}/100", ""]
+    if result["reason_codes"]:
+        lines.append("Reasons:")
+        lines += [f"- {code}" for code in result["reason_codes"][:8]]
+        lines.append("")
+    if result["price"] is not None:
+        lines.append(f"Price: {result['price']}")
+    lines.append(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    lines += ["", f"Filter version: {result['filter_version']}"]
+    body = "\n".join(lines)
+    send_mail(f"CECCHINO PRO — {result['ticker']} {result['previous_decision']} → {result['decision']}", body)
+    send_telegram(body)
+
+
+def backfill_decision_outcomes():
+    """Job periodico (cron tick): per ogni decisione con più di 3/6/12 mesi
+    non ancora ricontrollata a quella scadenza, registra il prezzo attuale
+    e il rendimento. Usa solo dati successivi al timestamp della decisione
+    (mai il prezzo di oggi per giudicare una decisione di oggi: niente
+    look-ahead)."""
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM decisions WHERE decision != 'DATA_UNAVAILABLE' "
+            "AND (checked_3m = 0 OR checked_6m = 0 OR checked_12m = 0)"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    now = datetime.now()
+    for row in rows:
+        try:
+            created = datetime.strptime(row["ts"].split(".")[0], "%Y-%m-%d %H:%M:%S")
+        except (ValueError, AttributeError, TypeError):
+            continue
+        age_days = (now - created).days
+        updates = {}
+        for horizon, days in (("3m", 90), ("6m", 180), ("12m", 365)):
+            if age_days >= days and not row[f"checked_{horizon}"]:
+                price_then = _bottleneck_price_now(row["ticker"])
+                updates[f"price_{horizon}"] = price_then
+                updates[f"checked_{horizon}"] = 1
+                if price_then and row["price"]:
+                    updates[f"return_{horizon}"] = round((price_then - row["price"]) / row["price"] * 100, 2)
+        if not updates:
+            continue
+        conn = get_db()
+        try:
+            set_clause = ", ".join(f"{k} = ?" for k in updates)
+            conn.execute(f"UPDATE decisions SET {set_clause} WHERE id = ?", (*updates.values(), row["id"]))
+            conn.commit()
+        finally:
+            conn.close()
 
 
 def compute_screener_signal(spec, analysis, recent_event=None):
@@ -2480,6 +2982,8 @@ def monitor_loop():
             generate_daily_verdict()
             maybe_run_weekly_screener()
             recheck_bottleneck_decisions()
+            run_decision_engine_for_portfolio()
+            backfill_decision_outcomes()
         except Exception as e:
             print(f"Errore monitor (riprova in 5 min): {e}")
             time.sleep(300)
@@ -2670,6 +3174,8 @@ def api_cron_tick():
     generate_daily_verdict()
     maybe_run_weekly_screener()
     recheck_bottleneck_decisions()
+    run_decision_engine_for_portfolio()
+    backfill_decision_outcomes()
     return jsonify({"ok": True})
 
 
@@ -2792,6 +3298,62 @@ def api_bottleneck_scan_results():
 @app.route("/api/accuratezza", methods=["GET"])
 def api_accuratezza():
     return jsonify(compute_bottleneck_accuracy())
+
+
+# --------------------------------------------------------------------------
+# API - Decision Engine (motore tecnico + fondamentale + bottleneck + news
+# uniti in un'unica decisione, sempre deterministico)
+# --------------------------------------------------------------------------
+@app.route("/api/decisions/<ticker>", methods=["GET"])
+def api_decision_get(ticker):
+    """Calcola (e registra) la decisione corrente per un ticker. Usato dal
+    pulsante "Analizza" dello Scanner per mostrare il PERCHÉ strutturato."""
+    return jsonify(evaluate_decision(ticker.upper().strip()))
+
+
+@app.route("/api/decisions", methods=["GET"])
+def api_decisions_log():
+    """Ultima decisione registrata per ogni ticker tracciato (tab Log)."""
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT d.* FROM decisions d "
+            "INNER JOIN (SELECT ticker, MAX(ts) AS max_ts FROM decisions GROUP BY ticker) latest "
+            "ON d.ticker = latest.ticker AND d.ts = latest.max_ts "
+            "ORDER BY d.ts DESC"
+        ).fetchall()
+    finally:
+        conn.close()
+    out = []
+    for row in rows:
+        out.append({
+            "ticker": row["ticker"], "ts": row["ts"], "price": row["price"],
+            "decision": row["decision"], "previous_decision": row["previous_decision"],
+            "changed": bool(row["changed"]), "final_score": row["final_score"],
+            "reason_codes": json.loads(row["reason_codes"]) if row["reason_codes"] else [],
+            "filter_version": row["filter_version"],
+        })
+    return jsonify(out)
+
+
+@app.route("/api/accuracy/decisions", methods=["GET"])
+def api_decision_accuracy():
+    return jsonify(compute_decision_accuracy())
+
+
+@app.route("/api/news/<ticker>", methods=["GET"])
+def api_news_events(ticker):
+    """Storico degli eventi notizia già classificati per un ticker (tab
+    News/Eventi)."""
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM news_events WHERE ticker = ? ORDER BY logged_at DESC LIMIT 30",
+            (ticker.upper().strip(),),
+        ).fetchall()
+    finally:
+        conn.close()
+    return jsonify([dict(row) for row in rows])
 
 
 # --------------------------------------------------------------------------
@@ -3449,6 +4011,7 @@ nav.bottom button.active { color: var(--blue); }
       </div>
     </div>
     <div id="scan-result"></div>
+    <div id="scan-decision"></div>
   </div>
 
   <!-- PORTAFOGLIO -->
@@ -3878,10 +4441,41 @@ async function scanTicker() {
   const ticker = document.getElementById('scan-input').value.trim().toUpperCase();
   if (!ticker) return;
   document.getElementById('scan-result').innerHTML = '<div class="spinner">Analisi in corso…</div>';
+  document.getElementById('scan-decision').innerHTML = '';
   const res = await fetch(`/api/scan/${ticker}`);
   const a = await res.json();
   const btn = a.error ? '' : `<button style="margin-top:10px" onclick="quickAdd('${a.ticker}', ${a.price})">+ Aggiungi al portafoglio</button>`;
   document.getElementById('scan-result').innerHTML = renderAnalysisCard(a, btn);
+  if (!a.error) loadDecision(ticker);
+}
+
+function decisionColor(d) {
+  return { BUY: 'var(--buy)', SELL: 'var(--sell)', HOLD: '#eab308', DATA_UNAVAILABLE: 'var(--dim)' }[d] || 'var(--dim)';
+}
+
+async function loadDecision(ticker) {
+  const el = document.getElementById('scan-decision');
+  el.innerHTML = '<div class="spinner">Decision Engine…</div>';
+  try {
+    const res = await fetch(`/api/decisions/${ticker}`);
+    const d = await res.json();
+    const scoreLine = d.final_score != null ? `<div class="metric"><div class="val">${d.final_score}/100</div><div class="lbl">Final score</div></div>` : '';
+    const layers = d.layers ? Object.entries(d.layers).map(([k, v]) => `
+      <div class="metric"><div class="val">${v != null ? Math.round(v) : '—'}</div><div class="lbl">${k}</div></div>
+    `).join('') : '';
+    const codes = (d.reason_codes || []).map(c => `<div>• ${c}</div>`).join('') || '<div class="dim">Nessun codice motivazione</div>';
+    const transition = d.previous_decision ? `${d.previous_decision} → ${d.decision}` : d.decision;
+    el.innerHTML = `
+      <div class="card">
+        <div class="row"><b style="font-size:14px">🧭 Decision Engine — PERCHÉ</b>
+          <span style="color:${decisionColor(d.decision)};font-weight:700">${transition}</span></div>
+        <div class="metrics" style="margin-top:8px">${scoreLine}${layers}</div>
+        <div class="reasons" style="margin-top:8px">${codes}</div>
+        <div class="dim" style="font-size:11px;margin-top:8px">Filter version: ${d.filter_version} — nessuna AI, formula fissa e versionata.</div>
+      </div>`;
+  } catch (e) {
+    el.innerHTML = '';
+  }
 }
 
 function quickAdd(ticker, price) {

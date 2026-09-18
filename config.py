@@ -271,22 +271,93 @@ DEFENSIVE_SECTORS = {"Difensivo", "Healthcare", "Salute", "Beni di consumo prima
 BOTTLENECK_CACHE_TTL_SECONDS = 24 * 3600
 
 # --------------------------------------------------------------------------
-# Verifica notizie senza AI (usata al posto di Gemini quando GEMINI_API_KEY
-# non è impostata — vedi check_recent_event in app.py). Confronto letterale,
-# case-insensitive, sul titolo della notizia: se una di queste frasi compare,
-# il titolo posseduto passa da HOLD a SELL (regola 3 dello screener
-# settimanale). È deterministico e gratuito, ma più grezzo di un'AI che
-# legge il contesto — può generare falsi positivi (una frase che cita
-# "lawsuit" senza riguardare l'azienda) o falsi negativi (un evento reale
-# descritto con parole diverse da queste). Modifica pure questa lista.
-NEWS_BREAK_KEYWORDS = [
-    "guidance cut", "cuts guidance", "guidance tagliata", "lowers guidance",
-    "misses estimates", "missed estimates", "earnings miss", "profit warning",
-    "downgrade", "downgraded", "declassato", "declassata",
-    "lawsuit", "causa legale", "class action", "investigation", "indagine",
-    "sec probe", "sec inquiry", "fraud", "frode",
-    "resigns", "resignation", "dimissioni", "steps down",
-    "recall", "richiamo", "data breach", "cyberattack",
-    "bankruptcy", "fallimento", "files for chapter 11", "delisting",
-    "slashes forecast", "cuts forecast",
+# Motore notizie deterministico (zero AI). Ogni regola ha una severità fissa
+# 0-10 e un elenco di frasi chiave (case-insensitive, italiano+inglese). Se
+# una frase compare in un titolo di notizia e non è negata nelle 4 parole
+# precedenti ("denies fraud", "rules out bankruptcy"), l'evento è
+# confermato. NEWS_SEVERITY_LABELS mappa la severità numerica a un'etichetta
+# (informational/watch/warning/serious/critical). Modifica pure queste
+# liste — sono l'unico posto dove aggiornare cosa conta come "evento reale".
+NEWS_RULES = {
+    "guidance_cut": {"severity": 7, "keywords": [
+        "guidance cut", "cuts guidance", "guidance tagliata", "lowers guidance",
+        "slashes forecast", "cuts forecast", "lowers forecast",
+    ]},
+    "earnings_miss": {"severity": 6, "keywords": [
+        "misses estimates", "missed estimates", "earnings miss", "profit warning",
+    ]},
+    "ceo_departure": {"severity": 6, "keywords": [
+        "ceo resigns", "ceo resignation", "ceo steps down", "dimissioni del ceo", "ceo departure",
+    ]},
+    "cfo_departure": {"severity": 4, "keywords": [
+        "cfo resigns", "cfo resignation", "cfo steps down",
+    ]},
+    "legal_issue": {"severity": 6, "keywords": [
+        "lawsuit", "causa legale", "class action", "sued", "denuncia",
+    ]},
+    "regulatory_investigation": {"severity": 7, "keywords": [
+        "investigation", "indagine", "probe launched", "under scrutiny",
+    ]},
+    "sec_action": {"severity": 9, "keywords": [
+        "sec charges", "sec action", "sec inquiry", "sec probe", "sec investigation",
+    ]},
+    "recall": {"severity": 5, "keywords": ["recall", "richiamo"]},
+    "fraud": {"severity": 10, "keywords": ["fraud", "frode"]},
+    "bankruptcy": {"severity": 10, "keywords": [
+        "bankruptcy", "fallimento", "files for chapter 11", "chapter 11",
+    ]},
+    "data_breach": {"severity": 6, "keywords": ["data breach", "cyberattack", "hacked"]},
+    "delisting": {"severity": 8, "keywords": ["delisting", "delisted"]},
+    "downgrade": {"severity": 4, "keywords": ["downgrade", "downgraded", "declassato", "declassata"]},
+    "dividend_cut": {"severity": 6, "keywords": [
+        "dividend cut", "cuts dividend", "suspends dividend", "taglia il dividendo",
+    ]},
+    "acquisition": {"severity": 2, "keywords": ["to acquire", "acquisition", "acquisisce"]},
+    "buyback": {"severity": 1, "keywords": ["buyback", "share repurchase"]},
+}
+
+NEWS_NEGATION_WORDS = [
+    "not ", "no ", "non ", "denies", "nega", "avoids", "evita",
+    "without ", "senza ", "rules out", "esclude", "unlikely",
 ]
+
+# Publisher considerati più affidabili (agenzie di stampa/testate
+# finanziarie primarie) — usati solo per pesare la confidenza, MAI per
+# decidere da soli se un evento è reale. Yahoo Finance mette insieme fonti
+# molto diverse: non è possibile distinguere comunicati ufficiali/SEC da
+# semplici articoli senza un servizio a pagamento dedicato — questa lista è
+# un'approssimazione dichiarata, non una vera gerarchia editoriale.
+NEWS_RELIABLE_PUBLISHERS = [
+    "Reuters", "Bloomberg", "Associated Press", "AP News",
+    "The Wall Street Journal", "CNBC", "MarketWatch", "Yahoo Finance",
+]
+
+NEWS_SEVERITY_LABELS = [
+    (9, "critical"), (7, "serious"), (5, "warning"), (3, "watch"), (0, "informational"),
+]
+
+# --------------------------------------------------------------------------
+# Decision Engine: unisce motore tecnico + Motore A (fondamentale) + Motore B
+# (bottleneck) + motore notizie in un unico FINAL_SCORE 0-100 e un'unica
+# decisione BUY/HOLD/SELL/DATA_UNAVAILABLE. Pesi e soglie fissi e versionati:
+# se li cambi, incrementa DECISION_ENGINE_VERSION così lo storico resta
+# confrontabile tra versioni diverse delle regole.
+DECISION_ENGINE_VERSION = "1.0"
+BOTTLENECK_FILTER_VERSION = "1.0"
+
+DECISION_WEIGHTS = {"technical": 0.35, "fundamental": 0.30, "bottleneck": 0.20, "news": 0.15}
+DECISION_BUY_THRESHOLD = 65.0
+DECISION_SELL_THRESHOLD = 35.0
+
+# Non ricalcolare il Decision Engine per lo stesso ticker più spesso di
+# così, anche se il tick automatico gira ogni 10 minuti: i dati (prezzo
+# escluso, già aggiornato altrove) non cambiano così in fretta, e i
+# provider gratuiti hanno limiti di frequenza.
+DECISION_ENGINE_MIN_INTERVAL_MINUTES = 60
+
+# Sotto questa soglia di osservazioni, l'Accuracy Engine mostra
+# "insufficient_sample" invece di una statistica: mai dichiarare un filtro
+# o una decisione "affidabile" con un campione troppo piccolo.
+MIN_ACCURACY_SAMPLE_SIZE = 5
+
+

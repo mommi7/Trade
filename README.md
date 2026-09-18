@@ -320,6 +320,31 @@ github.com → foto profilo in alto a destra → **Settings** →
     trimestrale non è esposto da Yahoo gratis: la dislocazione usa l'EBIT
     trimestrale come proxy. Ogni filtro mostra comunque il valore letto e
     la soglia, così è sempre chiaro cosa sta giudicando.
+- **Decision Engine 🧭 (Scanner → "PERCHÉ")**: sotto la card di ogni
+  ticker analizzato nello Scanner, un secondo blocco unisce **motore
+  tecnico + Motore A (fondamentale) + Motore B (bottleneck) + motore
+  notizie** in un'unica decisione BUY/HOLD/SELL/DATA_UNAVAILABLE, con un
+  punteggio 0-100 per ciascuno dei 4 livelli e i codici motivazione
+  (`T-...`, `F-...`, `B-...`, `N-...`) che l'hanno determinata — sempre
+  ricostruibile, zero AI, formula fissa e versionata
+  (`config.DECISION_ENGINE_VERSION`). Alert automatico su Telegram/mail
+  **solo quando la decisione cambia** rispetto all'ultima registrata per
+  quel ticker (mai un messaggio ripetuto a parità di stato), con un
+  messaggio a template fisso (ticker, transizione, score, motivi, prezzo,
+  timestamp, versione — niente testo generato). Ogni decisione viene
+  salvata in modo append-only (tabella `decisions`) insieme ai dati usati
+  per calcolarla, e un job periodico ricontrolla il prezzo a 3/6/12 mesi
+  per misurare (mai modificare da sola) l'affidabilità nel tempo —
+  `/api/accuracy/decisions` mostra win rate e rendimento medio per
+  BUY/SELL, ma segnala `insufficient_sample` invece di una percentuale se
+  le osservazioni sono troppo poche (sotto `config.MIN_ACCURACY_SAMPLE_SIZE`).
+  Il **motore notizie** che alimenta questo quarto livello è anch'esso
+  deterministico: confronta i titoli delle notizie Yahoo con
+  `config.NEWS_RULES` (18 tipi di evento, ciascuno con una severità
+  0-10 fissa), riconosce le negazioni ("denies fraud" non conta come
+  frode confermata) e logga ogni evento distinto in `news_events`
+  (`/api/news/<ticker>`) — nessuna interpretazione AI, stesso input
+  stesso output sempre.
 - **Ricerca ticker con suggerimenti**: scrivendo un simbolo o un nome
   (es. "micro", "bitcoin") negli input di Scanner, Portafoglio e Alert
   compare un menu a tendina con i titoli corrispondenti, da selezionare
