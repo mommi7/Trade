@@ -437,6 +437,7 @@ class DecisionEngineRegressionTests(unittest.TestCase):
         class Resp429:
             status_code = 429
             text = "Too Many Requests"
+            headers = {}
 
         orig_key = config.TWELVEDATA_API_KEY
         config.TWELVEDATA_API_KEY = "fake-key-for-test"
@@ -534,6 +535,179 @@ class DecisionEngineRegressionTests(unittest.TestCase):
         with patch("app.analyze_ticker", return_value={"error": "n/d"}) as mock_analyze:
             app.run_market_screener(send_email=False, force=True)
         mock_analyze.assert_called()
+
+    # ==================================================================
+    # DATA PROVIDER ROUTER + FINNHUB (master prompt: audit Twelve Data
+    # cost, provider indipendenza) — test 21-28
+    # ==================================================================
+
+    def _reset_finnhub_state(self):
+        app._FINNHUB_CANDLES_UNAVAILABLE = False
+        app._PRICE_CACHE.clear()
+        app._PRICE_INFLIGHT.clear()
+
+    # ------------------------------------------------------------------
+    # TEST 21 — Finnhub success: quando risponde con dati validi, deve
+    # essere usato per primo (priorità PRICE/OHLCV: Finnhub > Yahoo >
+    # Stooq > Twelve Data) e il risultato deve portare source="finnhub".
+    # ------------------------------------------------------------------
+    def test_21_finnhub_success_used_first(self):
+        self._reset_finnhub_state()
+        orig_key = config.FINNHUB_API_KEY
+        config.FINNHUB_API_KEY = "fake-key"
+        fake = {"closes": [1, 2, 3], "volumes": [1, 1, 1], "price": 100.0,
+                "currency": "USD", "name": "Mock", "source": "finnhub"}
+        try:
+            with patch("app.fetch_finnhub", return_value=fake), patch("app.fetch_yahoo") as mock_yahoo:
+                result = app.fetch_market_data("MU")
+            self.assertEqual(result["source"], "finnhub")
+            mock_yahoo.assert_not_called()
+        finally:
+            config.FINNHUB_API_KEY = orig_key
+
+    # ------------------------------------------------------------------
+    # TEST 22 — Finnhub 429: attiva il proprio circuit breaker (rule 6),
+    # non deve fare retry aggressivo, e la catena deve comunque proseguire
+    # sul provider successivo (Yahoo).
+    # ------------------------------------------------------------------
+    def test_22_finnhub_429_trips_circuit_and_falls_through(self):
+        self._reset_finnhub_state()
+        orig_key = config.FINNHUB_API_KEY
+        config.FINNHUB_API_KEY = "fake-key"
+
+        class Resp429:
+            status_code = 429
+            text = "rate limit exceeded"
+            headers = {}
+
+        fake_yahoo = {"closes": [1, 2, 3], "volumes": [1, 1, 1], "price": 50.0,
+                      "currency": "USD", "name": "Mock", "source": "yahoo"}
+        try:
+            with patch("app.requests.get", return_value=Resp429()), patch("app.fetch_yahoo", return_value=fake_yahoo):
+                result = app.fetch_market_data("ORCL")
+            self.assertEqual(result["source"], "yahoo")
+            self.assertFalse(app.finnhub_circuit_ok(),
+                              "TEST 22 FALLITO: un 429 reale di Finnhub deve attivare il suo circuit breaker")
+
+            # una seconda richiesta, con Finnhub ancora in cooldown, non deve
+            # nemmeno provare la rete verso Finnhub
+            with patch("app.requests.get") as mock_get, patch("app.fetch_yahoo", return_value=fake_yahoo):
+                app._PRICE_CACHE.clear()
+                app.fetch_market_data("ORCL")
+            mock_get.assert_not_called()
+        finally:
+            config.FINNHUB_API_KEY = orig_key
+
+    # ------------------------------------------------------------------
+    # TEST 23 — Finnhub non disponibile sul piano corrente (403): deve
+    # marcare UNAVAILABLE_ON_CURRENT_PLAN e MAI PIÙ ritentare quell'
+    # endpoint in questo processo (rule 5), invece di continuare a
+    # sprecare chiamate su qualcosa che sappiamo già non funzionare.
+    # ------------------------------------------------------------------
+    def test_23_finnhub_unavailable_on_plan_never_retried(self):
+        self._reset_finnhub_state()
+        orig_key = config.FINNHUB_API_KEY
+        config.FINNHUB_API_KEY = "fake-key"
+
+        class Resp403:
+            status_code = 403
+            text = "not available on your plan"
+            headers = {}
+
+        try:
+            with patch("app.requests.get", return_value=Resp403()):
+                app.fetch_finnhub("MU")
+            self.assertTrue(app._FINNHUB_CANDLES_UNAVAILABLE)
+
+            with patch("app.requests.get") as mock_get:
+                result = app.fetch_finnhub("ORCL")
+            mock_get.assert_not_called()
+            self.assertIsNone(result)
+        finally:
+            config.FINNHUB_API_KEY = orig_key
+            app._FINNHUB_CANDLES_UNAVAILABLE = False
+
+    # ------------------------------------------------------------------
+    # TEST 24 — catena di fallback completa: Finnhub e Yahoo falliscono,
+    # Stooq risponde. Il sistema deve produrre PRICE con source="stooq",
+    # non "ANALYSIS FAILED" (rule 27, primo scenario simulato).
+    # ------------------------------------------------------------------
+    def test_24_fallback_chain_produces_correct_source(self):
+        self._reset_finnhub_state()
+        fake_stooq = {"closes": [1] * 300, "volumes": [1] * 300, "price": 42.0,
+                      "currency": "USD", "name": "Mock", "source": "stooq"}
+        with patch("app.fetch_finnhub", return_value=None), \
+             patch("app.fetch_yahoo", return_value=None), \
+             patch("app.fetch_stooq", return_value=fake_stooq):
+            result = app.analyze_ticker("MU")
+        self.assertNotIn("error", result)
+        self.assertEqual(result["price_source"], "stooq")
+
+    # ------------------------------------------------------------------
+    # TEST 25 — tutti i provider falliscono: deve tornare PARTIAL
+    # ANALYSIS (errore esplicito con coverage ridotta a valle nel
+    # Decision Engine), mai un dato inventato (rule 17-18).
+    # ------------------------------------------------------------------
+    def test_25_all_providers_fail_gives_partial_analysis_not_invented_data(self):
+        self._reset_finnhub_state()
+        with patch("app.fetch_finnhub", return_value=None), \
+             patch("app.fetch_yahoo", return_value=None), \
+             patch("app.fetch_stooq", return_value=None), \
+             patch("app.fetch_twelvedata", return_value=None), \
+             patch("app.time.sleep", return_value=None):
+            result = app.analyze_ticker("MU")
+        self.assertIn("error", result)
+        self.assertNotIn("price", result)  # nessun prezzo inventato
+
+        with patch("app.fetch_market_data", return_value=None):
+            decision = app.evaluate_decision("MU")
+        self.assertEqual(decision["decision"], "DATA_UNAVAILABLE")
+
+    # ------------------------------------------------------------------
+    # TEST 26 — stato provider (rule 11): EXHAUSTED quando il budget
+    # giornaliero Twelve Data è finito, RATE_LIMITED quando il circuit
+    # breaker è attivo, UNAVAILABLE quando non è configurato.
+    # ------------------------------------------------------------------
+    def test_26_provider_status_classification(self):
+        self.assertEqual(app.get_provider_status("twelvedata", configured=False),
+                          app.PROVIDER_STATUS_UNAVAILABLE)
+
+        for _ in range(config.TWELVEDATA_DAILY_BUDGET):
+            app._record_provider_usage("twelvedata")
+        self.assertEqual(app.get_provider_status("twelvedata", configured=True),
+                          app.PROVIDER_STATUS_EXHAUSTED)
+
+    # ------------------------------------------------------------------
+    # TEST 27 — regressione ORCL: la nuova architettura provider non deve
+    # alterare l'esito del caso storico. Fundamental/bottleneck mancanti
+    # -> HOLD, mai BUY, indipendentemente da quale provider prezzo abbia
+    # risposto.
+    # ------------------------------------------------------------------
+    def test_27_orcl_regression_unaffected_by_provider_router(self):
+        self._reset_finnhub_state()
+        fake_price = {"closes": [100.0] * 260, "volumes": [1000.0] * 260, "price": 150.0,
+                      "currency": "USD", "name": "Oracle Corp", "source": "yahoo"}
+        with patch("app.fetch_finnhub", return_value=None), \
+             patch("app.fetch_yahoo", return_value=fake_price), \
+             patch("app.analyze_bottleneck", return_value={"ticker": "ORCL", "error": "dati non disponibili"}), \
+             patch.object(app.YAHOO_SESSION, "get", return_value=NoNewsResponse()):
+            result = app.evaluate_decision("ORCL")
+        self.assertNotEqual(result["decision"], "BUY",
+                             "TEST 27 FALLITO: il router provider non deve alterare la regressione ORCL")
+        self.assertEqual(result["decision"], "HOLD")
+
+    # ------------------------------------------------------------------
+    # TEST 28 — data failure ≠ negative data (rule 18/31): un filtro con
+    # dato mancante ha status "missing", mai "fail" — non deve mai essere
+    # confuso con un dato negativo reale che invece produce "fail".
+    # ------------------------------------------------------------------
+    def test_28_missing_data_never_confused_with_negative_value(self):
+        missing = app._mk_filter("fcf", "FCF", None, 0, "gte", "€")
+        self.assertEqual(missing["status"], "missing")
+
+        negative_real = app._mk_filter("fcf", "FCF", -500_000_000, 0, "gte", "€")
+        self.assertEqual(negative_real["status"], "fail")
+        self.assertNotEqual(missing["status"], negative_real["status"])
 
 
 if __name__ == "__main__":

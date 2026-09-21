@@ -492,17 +492,22 @@ def _warm_yahoo_session():
 # _TWELVEDATA_CALL_TIMES): servono a capire in tempo reale dove va la
 # quota, non a essere uno storico permanente.
 # --------------------------------------------------------------------------
+_PROVIDERS = ("finnhub", "yahoo", "stooq", "twelvedata")
 _METRICS_LOCK = threading.Lock()
 _METRICS = {
     "price_cache_hits": 0,
     "price_cache_misses": 0,
     "fundamentals_cache_hits": 0,
     "fundamentals_cache_misses": 0,
-    "provider_calls": {"yahoo": 0, "stooq": 0, "twelvedata": 0},
-    "provider_429": {"yahoo": 0, "stooq": 0, "twelvedata": 0},
-    "provider_latency_total": {"yahoo": 0.0, "stooq": 0.0, "twelvedata": 0.0},
+    "provider_calls": {p: 0 for p in _PROVIDERS},
+    "provider_429": {p: 0 for p in _PROVIDERS},
+    "provider_latency_total": {p: 0.0 for p in _PROVIDERS},
+    "provider_success": {p: 0 for p in _PROVIDERS},
     "fallback_count": 0,
-    "last_429": {"yahoo": None, "stooq": None, "twelvedata": None},
+    "last_429": {p: None for p in _PROVIDERS},
+    "last_429_reason": {p: None for p in _PROVIDERS},
+    "last_success": {p: None for p in _PROVIDERS},
+    "last_error": {p: None for p in _PROVIDERS},
 }
 
 
@@ -511,19 +516,37 @@ def _record_cache_metric(kind, hit):
         _METRICS[f"{kind}_cache_{'hits' if hit else 'misses'}"] += 1
 
 
-def _record_provider_call(provider, latency, status_code=None):
+def _record_provider_call(provider, latency, status_code=None, success=False, error=None, reason_429=None):
+    """Telemetria per provider — rule 19/10 del master prompt: non tutti i
+    429 sono uguali (rate limit al minuto vs quota giornaliera vs blocco
+    temporaneo), quindi reason_429 salva il motivo specifico quando lo
+    conosciamo (vedi _classify_twelvedata_429), non un generico 429."""
     with _METRICS_LOCK:
         _METRICS["provider_calls"][provider] += 1
         _METRICS["provider_latency_total"][provider] += latency
+        now = datetime.now().isoformat(timespec="seconds")
         if status_code == 429:
             _METRICS["provider_429"][provider] += 1
-            _METRICS["last_429"][provider] = datetime.now().isoformat(timespec="seconds")
+            _METRICS["last_429"][provider] = now
+            _METRICS["last_429_reason"][provider] = reason_429 or "UNKNOWN_429"
+        if success:
+            _METRICS["provider_success"][provider] += 1
+            _METRICS["last_success"][provider] = now
+        elif error:
+            _METRICS["last_error"][provider] = str(error)[:200]
+
+
+PROVIDER_STATUS_AVAILABLE = "AVAILABLE"
+PROVIDER_STATUS_DEGRADED = "DEGRADED"
+PROVIDER_STATUS_RATE_LIMITED = "RATE_LIMITED"
+PROVIDER_STATUS_EXHAUSTED = "EXHAUSTED"
+PROVIDER_STATUS_UNAVAILABLE = "UNAVAILABLE"
 
 
 def get_metrics_snapshot():
     with _METRICS_LOCK:
         snap = json.loads(json.dumps(_METRICS))  # copia semplice, evita riferimenti condivisi
-    for provider in ("yahoo", "stooq", "twelvedata"):
+    for provider in _PROVIDERS:
         calls = snap["provider_calls"][provider]
         total_latency = snap["provider_latency_total"].pop(provider)
         snap.setdefault("provider_avg_latency_ms", {})[provider] = (
@@ -538,6 +561,28 @@ def get_metrics_snapshot():
     return snap
 
 
+def get_provider_status(provider, configured=True):
+    """AVAILABLE / DEGRADED / RATE_LIMITED / EXHAUSTED / UNAVAILABLE (rule
+    11). Non richiede stato aggiuntivo: deriva dalla telemetria già
+    raccolta (ultimo 429, budget, circuit breaker) — nessuna doppia fonte
+    di verità."""
+    if not configured:
+        return PROVIDER_STATUS_UNAVAILABLE
+    if provider == "twelvedata":
+        if not twelvedata_budget_ok():
+            return PROVIDER_STATUS_EXHAUSTED
+        if not twelvedata_circuit_ok():
+            return PROVIDER_STATUS_RATE_LIMITED
+    with _METRICS_LOCK:
+        last_429 = _METRICS["last_429"][provider]
+        last_success = _METRICS["last_success"][provider]
+    if last_429 and (not last_success or last_429 > last_success):
+        return PROVIDER_STATUS_RATE_LIMITED
+    if last_success is None and _METRICS["provider_calls"][provider] > 0:
+        return PROVIDER_STATUS_DEGRADED
+    return PROVIDER_STATUS_AVAILABLE
+
+
 def fetch_yahoo(ticker, errors=None):
     """Fetch diretto senza yfinance. Prova 2 server, torna None se falliscono entrambi.
     Se 'errors' è una lista, ci accoda il motivo del fallimento (visibile poi
@@ -548,7 +593,9 @@ def fetch_yahoo(ticker, errors=None):
         try:
             url = f"https://{base}.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=2y"
             r = YAHOO_SESSION.get(url, timeout=12)
-            _record_provider_call("yahoo", time.time() - t0, r.status_code)
+            _record_provider_call("yahoo", time.time() - t0, r.status_code,
+                                   success=(r.status_code == 200),
+                                   error=None if r.status_code == 200 else f"HTTP {r.status_code}")
             if r.status_code != 200:
                 msg = f"Yahoo {base} HTTP {r.status_code}"
                 print(f"{msg} per {ticker}: {r.text[:200]!r}")
@@ -574,6 +621,7 @@ def fetch_yahoo(ticker, errors=None):
                 "price": float(meta.get("regularMarketPrice", closes[-1])),
                 "currency": meta.get("currency", "USD"),
                 "name": meta.get("shortName", ticker),
+                "source": "yahoo",
             }
         except Exception as e:
             print(f"Yahoo {base} fallito per {ticker}: {e}")
@@ -600,8 +648,10 @@ def fetch_stooq(ticker, errors=None):
         t0 = time.time()
         url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
         r = requests.get(url, headers=YAHOO_HEADERS, timeout=12)
-        _record_provider_call("stooq", time.time() - t0, r.status_code)
-        if r.status_code != 200 or not r.text.startswith("Date,"):
+        stooq_ok = r.status_code == 200 and r.text.startswith("Date,")
+        _record_provider_call("stooq", time.time() - t0, r.status_code, success=stooq_ok,
+                               error=None if stooq_ok else f"HTTP {r.status_code}")
+        if not stooq_ok:
             msg = f"Stooq HTTP {r.status_code}" if r.status_code != 200 else "Stooq: simbolo non trovato"
             print(f"{msg} per {ticker}: {r.text[:120]!r}")
             if errors is not None:
@@ -628,6 +678,7 @@ def fetch_stooq(ticker, errors=None):
             "price": closes[-1],
             "currency": "USD",
             "name": ticker.upper(),
+            "source": "stooq",
         }
     except Exception as e:
         print(f"Stooq fallito per {ticker}: {e}")
@@ -746,6 +797,27 @@ def twelvedata_circuit_ok():
     return not until or time.time() >= until
 
 
+def _classify_twelvedata_429(response_text, retry_after_header):
+    """Rule 10: non tutti i 429 sono uguali. Twelve Data non ha un formato
+    strutturato per distinguerli, ma il testo del messaggio d'errore lo
+    dice quasi sempre esplicitamente ("run out of API credits for the
+    current day/minute"). L'header Retry-After, se presente, è più
+    affidabile di qualunque euristica sul testo — usato quando c'è."""
+    if retry_after_header:
+        try:
+            return "TEMPORARY_LIMIT", max(1, int(float(retry_after_header)))
+        except (TypeError, ValueError):
+            pass
+    text = (response_text or "").lower()
+    if "day" in text or "daily" in text:
+        return "DAILY_QUOTA_EXCEEDED", 24 * 3600
+    if "minute" in text:
+        return "RATE_LIMIT_MINUTE", 60
+    if not text:
+        return "UNKNOWN_429", config.TWELVEDATA_CIRCUIT_COOLDOWN_SECONDS
+    return "TEMPORARY_LIMIT", config.TWELVEDATA_CIRCUIT_COOLDOWN_SECONDS
+
+
 def fetch_twelvedata(ticker, errors=None):
     """Terzo fallback, con API key gratuita (twelvedata.com). Usato solo se
     TWELVEDATA_API_KEY è impostata: utile quando l'hosting cloud ha l'IP
@@ -775,15 +847,17 @@ def fetch_twelvedata(ticker, errors=None):
             "apikey": config.TWELVEDATA_API_KEY,
         }
         r = requests.get(url, params=params, timeout=12)
-        _record_provider_call("twelvedata", time.time() - t0, r.status_code)
         if r.status_code == 429:
-            _circuit_trip("twelvedata", config.TWELVEDATA_CIRCUIT_COOLDOWN_SECONDS)
-            msg = "Twelve Data HTTP 429 — circuit breaker attivato"
+            reason, cooldown = _classify_twelvedata_429(r.text, r.headers.get("Retry-After"))
+            _record_provider_call("twelvedata", time.time() - t0, r.status_code, reason_429=reason)
+            _circuit_trip("twelvedata", cooldown)
+            msg = f"Twelve Data HTTP 429 ({reason}) — circuit breaker attivato per {cooldown}s"
             print(f"{msg} per {ticker}")
             if errors is not None:
                 errors.append(msg)
             return None
         if r.status_code != 200:
+            _record_provider_call("twelvedata", time.time() - t0, r.status_code, error=f"HTTP {r.status_code}")
             msg = f"Twelve Data HTTP {r.status_code}"
             print(f"{msg} per {ticker}: {r.text[:200]!r}")
             if errors is not None:
@@ -792,10 +866,12 @@ def fetch_twelvedata(ticker, errors=None):
         j = r.json()
         if j.get("status") == "error" or "values" not in j:
             api_msg = j.get("message", str(j)[:150])
+            _record_provider_call("twelvedata", time.time() - t0, r.status_code, error=api_msg)
             print(f"Twelve Data errore per {ticker}: {api_msg}")
             if errors is not None:
                 errors.append(f"Twelve Data: {api_msg}")
             return None
+        _record_provider_call("twelvedata", time.time() - t0, r.status_code, success=True)
         values = list(reversed(j["values"]))  # dal più vecchio al più recente
         closes, volumes = [], []
         for v in values:
@@ -814,6 +890,7 @@ def fetch_twelvedata(ticker, errors=None):
             "price": closes[-1],
             "currency": "USD",
             "name": ticker.upper(),
+            "source": "twelvedata",
         }
     except Exception as e:
         print(f"Twelve Data fallito per {ticker}: {e}")
@@ -822,17 +899,138 @@ def fetch_twelvedata(ticker, errors=None):
         return None
 
 
+_FINNHUB_LOCK = threading.Lock()
+_FINNHUB_CALL_TIMES = []
+_FINNHUB_CANDLES_UNAVAILABLE = False  # True al primo rifiuto per piano: mai più ritentato in questo processo
+
+
+def _throttle_finnhub():
+    with _FINNHUB_LOCK:
+        now = time.time()
+        while _FINNHUB_CALL_TIMES and now - _FINNHUB_CALL_TIMES[0] > 60:
+            _FINNHUB_CALL_TIMES.pop(0)
+        if len(_FINNHUB_CALL_TIMES) >= config.FINNHUB_RPM_LIMIT:
+            wait = 60 - (now - _FINNHUB_CALL_TIMES[0]) + 0.5
+            if wait > 0:
+                time.sleep(wait)
+            now = time.time()
+            while _FINNHUB_CALL_TIMES and now - _FINNHUB_CALL_TIMES[0] > 60:
+                _FINNHUB_CALL_TIMES.pop(0)
+        _FINNHUB_CALL_TIMES.append(time.time())
+
+
+def finnhub_circuit_ok():
+    until = _circuit_blocked_until("finnhub")
+    return not until or time.time() >= until
+
+
+def fetch_finnhub(ticker, errors=None):
+    """Fallback prezzo/OHLCV aggiuntivo (rule 4 del master prompt). Usa
+    /stock/candle, che su molti piani free di Finnhub NON è disponibile per
+    azioni USA (a differenza di /quote, sempre gratuito ma senza storico
+    utilizzabile per RSI/medie) — verificato a runtime (rule 5), mai
+    assunto: al primo rifiuto per piano marca l'endpoint
+    UNAVAILABLE_ON_CURRENT_PLAN e non lo ritenta più in questo processo,
+    per non sprecare chiamate su qualcosa che sappiamo già non
+    funzionare. Nessuna chiave configurata = provider disattivato,
+    esattamente come Twelve Data."""
+    global _FINNHUB_CANDLES_UNAVAILABLE
+    if not config.FINNHUB_API_KEY:
+        if errors is not None:
+            errors.append("Finnhub: FINNHUB_API_KEY non configurata")
+        return None
+    if _FINNHUB_CANDLES_UNAVAILABLE:
+        if errors is not None:
+            errors.append("Finnhub: candele storiche non disponibili sul piano corrente")
+        return None
+    if not finnhub_circuit_ok():
+        if errors is not None:
+            errors.append("Finnhub: 429 recente, in pausa (circuit breaker)")
+        return None
+    if is_crypto_ticker(ticker):
+        # Finnhub usa simboli diversi per le crypto (es. BINANCE:BTCUSDT):
+        # fuori scope per questa integrazione, salta al prossimo fallback.
+        if errors is not None:
+            errors.append("Finnhub: crypto non supportata in questa integrazione")
+        return None
+    try:
+        _throttle_finnhub()
+        t0 = time.time()
+        to_ts = int(time.time())
+        from_ts = to_ts - 2 * 365 * 24 * 3600  # ~2 anni, come Yahoo/Stooq
+        url = "https://finnhub.io/api/v1/stock/candle"
+        params = {"symbol": ticker, "resolution": "D", "from": from_ts, "to": to_ts,
+                  "token": config.FINNHUB_API_KEY}
+        r = requests.get(url, params=params, timeout=12)
+        if r.status_code == 429:
+            _record_provider_call("finnhub", time.time() - t0, r.status_code, reason_429="RATE_LIMIT_MINUTE")
+            _circuit_trip("finnhub", 60)  # free tier: limite al minuto, raffreddamento breve basta
+            msg = "Finnhub HTTP 429 — circuit breaker attivato"
+            print(f"{msg} per {ticker}")
+            if errors is not None:
+                errors.append(msg)
+            return None
+        if r.status_code in (401, 403):
+            _FINNHUB_CANDLES_UNAVAILABLE = True
+            _record_provider_call("finnhub", time.time() - t0, r.status_code, error="UNAVAILABLE_ON_CURRENT_PLAN")
+            msg = f"Finnhub: candele storiche non disponibili sul piano corrente (HTTP {r.status_code})"
+            print(f"{msg} per {ticker}")
+            if errors is not None:
+                errors.append(msg)
+            return None
+        if r.status_code != 200:
+            _record_provider_call("finnhub", time.time() - t0, r.status_code, error=f"HTTP {r.status_code}")
+            msg = f"Finnhub HTTP {r.status_code}"
+            print(f"{msg} per {ticker}: {r.text[:200]!r}")
+            if errors is not None:
+                errors.append(msg)
+            return None
+        j = r.json()
+        if j.get("s") != "ok" or not j.get("c"):
+            # "s": "no_data" è normale per ticker sconosciuti a Finnhub, non
+            # necessariamente un problema di piano: non marca UNAVAILABLE.
+            _record_provider_call("finnhub", time.time() - t0, r.status_code, error=f"no data (s={j.get('s')})")
+            if errors is not None:
+                errors.append(f"Finnhub: nessun dato ({j.get('s', 'unknown')})")
+            return None
+        closes = [float(c) for c in j["c"]]
+        volumes = [float(v) for v in j.get("v", [0] * len(closes))]
+        if len(closes) < 2:
+            _record_provider_call("finnhub", time.time() - t0, r.status_code, error="dati insufficienti")
+            if errors is not None:
+                errors.append("Finnhub: dati storici insufficienti")
+            return None
+        _record_provider_call("finnhub", time.time() - t0, r.status_code, success=True)
+        return {
+            "closes": closes,
+            "volumes": volumes,
+            "price": closes[-1],
+            "currency": "USD",
+            "name": ticker.upper(),
+            "source": "finnhub",
+        }
+    except Exception as e:
+        print(f"Finnhub fallito per {ticker}: {e}")
+        if errors is not None:
+            errors.append(f"Finnhub: {e}")
+        return None
+
+
 def _fetch_market_data_live(ticker, errors=None, use_twelvedata=True):
-    """La vera catena di fetch: Yahoo, poi Stooq, poi Twelve Data (se
-    configurata e se use_twelvedata=True). Se tutte falliscono, un secondo
-    giro dopo una breve pausa: il caso più comune su Render free è un cold
-    start (processo appena risvegliato dallo sleep) che arriva insieme a un
-    429 momentaneo di Yahoo — spesso sparisce da solo dopo pochi secondi.
-    Nessuna cache qui: la aggiunge fetch_market_data sopra a questa."""
+    """La vera catena di fetch, priorità PRICE/OHLCV (rule 3 del master
+    prompt): Finnhub, poi Yahoo, poi Stooq, poi Twelve Data (se configurata
+    e se use_twelvedata=True) come ultima istanza. Se tutte falliscono, un
+    secondo giro dopo una breve pausa: il caso più comune su Render free è
+    un cold start (processo appena risvegliato dallo sleep) che arriva
+    insieme a un 429 momentaneo — spesso sparisce da solo dopo pochi
+    secondi. Nessuna cache qui: la aggiunge fetch_market_data sopra a
+    questa. Finnhub e Twelve Data, senza chiave configurata, tornano
+    sempre None senza fare nulla — nessun comportamento diverso se non
+    sono attivati."""
     def _td(t, e):
         return fetch_twelvedata(t, e) if use_twelvedata else None
 
-    data = fetch_yahoo(ticker, errors) or fetch_stooq(ticker, errors) or _td(ticker, errors)
+    data = fetch_finnhub(ticker, errors) or fetch_yahoo(ticker, errors) or fetch_stooq(ticker, errors) or _td(ticker, errors)
     if data:
         return data
     with _METRICS_LOCK:
@@ -840,7 +1038,7 @@ def _fetch_market_data_live(ticker, errors=None, use_twelvedata=True):
     time.sleep(3)
     if errors is not None:
         errors.append("--- ritento dopo 3s ---")
-    return fetch_yahoo(ticker, errors) or fetch_stooq(ticker, errors) or _td(ticker, errors)
+    return fetch_finnhub(ticker, errors) or fetch_yahoo(ticker, errors) or fetch_stooq(ticker, errors) or _td(ticker, errors)
 
 
 _PRICE_CACHE_LOCK = threading.Lock()
@@ -2031,6 +2229,7 @@ def analyze_ticker(ticker, custom_buy=None, custom_sell=None, use_twelvedata=Tru
             "currency": data["currency"],
             "price": round(data["price"], 2),
             "updated": datetime.now().isoformat(timespec="seconds"),
+            "price_source": data.get("source"),
             **sig,
         }
         result["ai_commentary"] = generate_ai_commentary(ticker, result)
@@ -3758,41 +3957,47 @@ def api_cron_tick_status():
 
 @app.route("/api/health/providers", methods=["GET"])
 def api_health_providers():
-    """Stato essenziale delle fonti dati esterne — pensato per capire in un
-    secondo, senza dover controllare la dashboard di Twelve Data, se la
-    quota giornaliera si sta avvicinando al limite. Le metriche (chiamate,
-    cache hit rate, 429, latenza) sono in memoria di processo: si azzerano
-    a ogni redeploy, sono osservabilità del momento, non uno storico."""
-    td_used = get_provider_usage_today("twelvedata")
-    circuit_until = _circuit_blocked_until("twelvedata")
-    circuit_seconds_left = round(circuit_until - time.time()) if circuit_until and circuit_until > time.time() else 0
+    """Stato di ogni fonte dati esterna (rule 12 del master prompt) —
+    pensato per capire in un secondo, senza dover controllare le dashboard
+    esterne, quale provider è disponibile/degradato/esaurito in questo
+    momento. Le metriche (chiamate, cache hit rate, 429, latenza) sono in
+    memoria di processo: si azzerano a ogni redeploy, sono osservabilità
+    del momento, non uno storico permanente."""
     metrics = get_metrics_snapshot()
+
+    def provider_block(provider, configured, extra=None):
+        circuit_until = _circuit_blocked_until(provider)
+        cooldown = round(circuit_until - time.time()) if circuit_until and circuit_until > time.time() else 0
+        block = {
+            "status": get_provider_status(provider, configured=configured),
+            "configured": configured,
+            "requests_today": metrics["provider_calls"][provider],
+            "count_429": metrics["provider_429"][provider],
+            "last_429": metrics["last_429"][provider],
+            "last_429_reason": metrics["last_429_reason"][provider],
+            "last_success": metrics["last_success"][provider],
+            "last_error": metrics["last_error"][provider],
+            "avg_latency_ms": metrics["provider_avg_latency_ms"][provider],
+            "cooldown_remaining_seconds": cooldown,
+        }
+        if extra:
+            block.update(extra)
+        return block
+
+    td_used = get_provider_usage_today("twelvedata")
     return jsonify({
-        "twelvedata": {
-            "configured": bool(config.TWELVEDATA_API_KEY),
+        "finnhub": provider_block("finnhub", bool(config.FINNHUB_API_KEY), {
+            "candles_unavailable_on_plan": _FINNHUB_CANDLES_UNAVAILABLE,
+            "rpm_limit": config.FINNHUB_RPM_LIMIT,
+        }),
+        "yahoo": provider_block("yahoo", True),
+        "stooq": provider_block("stooq", True),
+        "twelvedata": provider_block("twelvedata", bool(config.TWELVEDATA_API_KEY), {
             "used_today": td_used,
             "estimated_credits_today": td_used,  # 1 credito per chiamata time_series
             "budget": config.TWELVEDATA_DAILY_BUDGET,
             "budget_ok": twelvedata_budget_ok(),
-            "circuit_breaker": not twelvedata_circuit_ok(),
-            "cooldown_remaining_seconds": circuit_seconds_left,
-            "api_calls_today": metrics["provider_calls"]["twelvedata"],
-            "count_429": metrics["provider_429"]["twelvedata"],
-            "last_429": metrics["last_429"]["twelvedata"],
-            "avg_latency_ms": metrics["provider_avg_latency_ms"]["twelvedata"],
-        },
-        "yahoo": {
-            "api_calls_today": metrics["provider_calls"]["yahoo"],
-            "count_429": metrics["provider_429"]["yahoo"],
-            "last_429": metrics["last_429"]["yahoo"],
-            "avg_latency_ms": metrics["provider_avg_latency_ms"]["yahoo"],
-        },
-        "stooq": {
-            "api_calls_today": metrics["provider_calls"]["stooq"],
-            "count_429": metrics["provider_429"]["stooq"],
-            "last_429": metrics["last_429"]["stooq"],
-            "avg_latency_ms": metrics["provider_avg_latency_ms"]["stooq"],
-        },
+        }),
         "cache": {
             "price_cache_hit_rate_pct": metrics["price_cache_hit_rate_pct"],
             "price_cache_hits": metrics["price_cache_hits"],
@@ -5442,6 +5647,8 @@ const DECISION_LABELS = {
   BUY_BLOCKED: 'BUY BLOCCATO', DATA_UNAVAILABLE: 'DATI NON DISPONIBILI',
 };
 
+const PROVIDER_LABELS = { finnhub: 'Finnhub', yahoo: 'Yahoo', stooq: 'Stooq', twelvedata: 'Twelve Data' };
+
 function timeAgo(iso) {
   if (!iso) return null;
   const diffMin = Math.round((Date.now() - new Date(iso).getTime()) / 60000);
@@ -5524,7 +5731,7 @@ function renderScannerResult(a, d) {
         <div style="font-size:26px;font-weight:800;color:${decisionColor(decision)};margin-top:4px">${label}</div>
       </div>
       <div class="row" style="margin-top:10px;font-size:12px">
-        <span class="dim">Dati aggiornati: ${freshness || '—'}</span>
+        <span class="dim">Dati aggiornati: ${freshness || '—'}${a.price_source ? ' · fonte: ' + (PROVIDER_LABELS[a.price_source] || a.price_source) : ''}</span>
         ${isStale ? '<span style="color:var(--sell)">⚠ DATI NON RECENTI</span>' : ''}
       </div>
       <div class="row" style="margin-top:12px">

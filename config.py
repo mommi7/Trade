@@ -27,6 +27,14 @@ CRON_SECRET = os.environ.get("CECCHINO_CRON_SECRET", "")
 # URL pubblico dell'app, usato solo nel testo delle mail di alert.
 PUBLIC_URL = os.environ.get("CECCHINO_PUBLIC_URL", "http://localhost:5000")
 
+# Fallback prezzo aggiuntivo (opzionale). https://finnhub.io — free tier
+# senza carta, limite per-minuto molto più permissivo di Twelve Data (niente
+# tetto giornaliero stretto), ma NON garantisce storico OHLCV completo su
+# ogni piano: verificato a runtime (vedi finnhub_candles_status), mai
+# assunto. Lasciala vuota per non usarla — l'app funziona lo stesso.
+FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY", "")
+FINNHUB_RPM_LIMIT = int(os.environ.get("FINNHUB_RPM_LIMIT", "50"))  # free tier: 60/min, margine di sicurezza
+
 # Terzo fallback per i dati di mercato (opzionale). Se Yahoo e Stooq sono
 # entrambi irraggiungibili dall'hosting (capita su alcuni IP cloud), l'app
 # usa questa API gratuita: https://twelvedata.com (free tier, no carta,
