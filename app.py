@@ -4623,6 +4623,11 @@ nav.bottom button.active { color: var(--blue); }
   <!-- STORICO -->
   <div class="tab-view" id="tab-history">
     <div class="dim" style="font-size:12px;margin-bottom:8px">🧭 Storico delle decisioni del Decision Engine — la stessa fonte usata per gli alert Telegram/mail. È l'unica decisione autorevole dell'app.</div>
+    <div class="card" id="accuracy-card">
+      <b style="font-size:14px">📊 Performance storica</b>
+      <div class="dim" style="font-size:12px;margin-top:4px">Rendimento reale delle decisioni BUY/SELL passate, ricontrollato a 3/6/12 mesi di distanza — mai il prezzo di oggi per giudicare una decisione di oggi. È performance storica, non una probabilità di successo futuro.</div>
+      <div id="accuracy-content" style="margin-top:10px" class="dim">Caricamento…</div>
+    </div>
     <div id="decisions-history-list"></div>
     <div class="card" style="margin-top:16px">
       <b style="font-size:14px">📊 Segnale tecnico (solo un livello del Decision Engine)</b>
@@ -5421,8 +5426,26 @@ async function loadDecisionsHistory() {
   }
 }
 
+async function loadAccuracy() {
+  const el = document.getElementById('accuracy-content');
+  try {
+    const res = await fetch('/api/accuracy/decisions');
+    const data = await res.json();
+    const row = (label, stats) => {
+      if (stats.insufficient_sample) {
+        return `<div class="row" style="margin-top:6px"><span>${label}</span><span class="dim">campione insufficiente (${stats.sample_size}/${data.min_sample_size})</span></div>`;
+      }
+      return `<div class="row" style="margin-top:6px"><span>${label}</span><span><b>${stats.win_rate_pct}%</b> win rate · rendimento medio ${stats.avg_return_pct >= 0 ? '+' : ''}${stats.avg_return_pct}% (n=${stats.sample_size})</span></div>`;
+    };
+    el.innerHTML = row('BUY', data.buy) + row('SELL', data.sell);
+  } catch (e) {
+    el.textContent = 'Errore nel caricamento.';
+  }
+}
+
 async function loadHistory() {
   loadDecisionsHistory();
+  loadAccuracy();
   document.getElementById('history-list').innerHTML = '<div class="spinner">Caricamento…</div>';
   const res = await fetch('/api/history');
   const data = await res.json();
