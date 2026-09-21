@@ -1,21 +1,23 @@
 """
 Regression test obbligatori per il Decision Engine (vedi master prompt
-sezione 52). Copre i 5 scenari critici: il caso storico ORCL (BUY gonfiato
-da dati mancanti), il comportamento invariato con dati completi, un solo
-livello mancante (copertura sopra soglia), due livelli mancanti (copertura
-sotto soglia) e il Critical-Data Gate (FCF mancante blocca il BUY anche con
-copertura sufficiente).
+sezione 52). Copre i 5 scenari critici originali (ORCL, dati completi,
+copertura sopra/sotto soglia, Critical-Data Gate) più i regression test
+aggiunti per bloccare i bug corretti in questa sessione: doppio canale di
+alert Telegram, notizie positive scambiate per rischio, deduplica headline,
+e lo storico delle decisioni (Storico) che deve leggere dalla stessa fonte
+degli alert.
 
 Eseguibile senza rete e senza dipendenze extra:
     python3 -m unittest tests.test_decision_engine -v
 (dalla cartella del repository, con signals.db non condiviso con l'app in
 esecuzione: ogni test usa un DB temporaneo dedicato).
 """
+import json
 import os
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.setdefault("CECCHINO_CRON_SECRET", "test-secret")
@@ -159,6 +161,146 @@ class DecisionEngineRegressionTests(unittest.TestCase):
         self.assertEqual(result["decision"], "BUY_BLOCKED",
                           "TEST 5 FALLITO: FCF mancante deve bloccare il BUY anche con copertura sufficiente")
         self.assertTrue(any(c.startswith("HARD-BLOCK-CRITICAL-FUNDAMENTAL-MISSING") for c in result["reason_codes"]))
+
+    # ------------------------------------------------------------------
+    # TEST 6 — un solo canale di alert: notify_decision_change deve
+    # mandare esattamente UN messaggio Telegram e nessun secondo alert
+    # dal segnale tecnico (record_signal_if_changed non deve più chiamare
+    # nessuna funzione di notifica propria).
+    # ------------------------------------------------------------------
+    def test_06_single_alert_channel_no_duplicate_telegram(self):
+        self.assertFalse(hasattr(app, "notify_signal_change"),
+                          "TEST 6 FALLITO: notify_signal_change non deve più esistere, "
+                          "altrimenti può rimandare un secondo alert indipendente")
+        conn = app.get_db()
+        try:
+            with patch("app.send_telegram") as mock_telegram, patch("app.send_mail"):
+                app.record_signal_if_changed(conn, "MU", {
+                    "signal": "BUY", "price": 100.0, "score": 60, "rsi": 55, "reasons": ["test"],
+                })
+            mock_telegram.assert_not_called()
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------------------
+    # TEST 7 — BUY_BLOCKED ha un messaggio Telegram dedicato (regola 36):
+    # niente falso silenzio quando un BUY viene fermato dai gate sui dati.
+    # ------------------------------------------------------------------
+    def test_07_buy_blocked_has_dedicated_telegram_message(self):
+        result = {
+            "ticker": "NOFCF", "decision": "BUY_BLOCKED", "previous_decision": "HOLD",
+            "final_score": 82.0, "coverage_pct": 100.0,
+            "reason_codes": ["HARD-BLOCK-CRITICAL-FUNDAMENTAL-MISSING:fcf"],
+            "price": 200.0, "filter_version": config.DECISION_ENGINE_VERSION,
+        }
+        with patch("app.send_telegram") as mock_telegram, patch("app.send_mail"):
+            app.notify_decision_change(result)
+        mock_telegram.assert_called_once()
+        sent_text = mock_telegram.call_args[0][0]
+        self.assertIn("BLOCCATA", sent_text)
+        self.assertIn("BUY_BLOCKED", sent_text)
+
+    # ------------------------------------------------------------------
+    # TEST 8 — solo eventi negativi possono diventare il "best" evento
+    # usato per lo scoring/rischio: un major contract (positivo, severità
+    # alta) non deve mai essere scambiato per un evento di rischio.
+    # ------------------------------------------------------------------
+    def test_08_positive_news_never_becomes_risk_event(self):
+        fake_items = [{
+            "title": "Acme Corp wins major $5B multi-year contract",
+            "publisher": "Reuters", "providerPublishTime": 1700000000,
+            "link": "https://example.com/1",
+        }]
+        with patch("app._fetch_recent_news", return_value=fake_items):
+            news = app.assess_news("ACME")
+        self.assertIsNone(news["direction"],
+                           "TEST 8 FALLITO: nessun evento negativo presente, 'best' deve restare vuoto")
+        self.assertEqual(news["severity"], 0)
+        self.assertEqual(len(news["events"]), 1)
+        self.assertEqual(news["events"][0]["direction"], "positive")
+
+    # ------------------------------------------------------------------
+    # TEST 9 — deduplica: la stessa notizia ripresa da fonti/indicizzazioni
+    # diverse (stesso titolo normalizzato) conta come un solo evento.
+    # ------------------------------------------------------------------
+    def test_09_duplicate_headlines_deduplicated(self):
+        fake_items = [
+            {"title": "Company X guidance cut for next quarter", "publisher": "Reuters",
+             "providerPublishTime": 1700000000, "link": "https://example.com/a"},
+            {"title": "Company X guidance cut for next quarter!", "publisher": "Bloomberg",
+             "providerPublishTime": 1700000100, "link": "https://example.com/b"},
+        ]
+        with patch("app._fetch_recent_news", return_value=fake_items):
+            news = app.assess_news("DUPX")
+        self.assertEqual(len(news["events"]), 1,
+                          "TEST 9 FALLITO: due titoli quasi identici devono contare come un solo evento")
+
+    # ------------------------------------------------------------------
+    # TEST 10 — /api/decisions/history legge solo le righe changed=1 (la
+    # stessa fonte usata dagli alert), non ogni valutazione periodica.
+    # ------------------------------------------------------------------
+    def test_10_decisions_history_endpoint_matches_alert_source(self):
+        conn = app.get_db()
+        try:
+            conn.execute(
+                "INSERT INTO decisions (ticker, ts, price, decision, previous_decision, changed, "
+                "final_score, reason_codes, filter_version) VALUES "
+                "('MU', '2026-09-20T10:00:00', 105.0, 'HOLD', 'BUY', 1, 55.2, ?, '1.1')",
+                (json.dumps(["DATA-COVERAGE-LOW-35PCT"]),),
+            )
+            conn.execute(
+                "INSERT INTO decisions (ticker, ts, price, decision, previous_decision, changed, "
+                "final_score, reason_codes, filter_version) VALUES "
+                "('MU', '2026-09-20T11:00:00', 106.0, 'HOLD', 'HOLD', 0, 55.0, '[]', '1.1')"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        client = app.app.test_client()
+        resp = client.get("/api/decisions/history")
+        self.assertEqual(resp.status_code, 200)
+        rows = resp.get_json()
+        self.assertEqual(len(rows), 1, "TEST 10 FALLITO: deve tornare solo la riga con changed=1")
+        self.assertEqual(rows[0]["decision"], "HOLD")
+        self.assertEqual(rows[0]["previous_decision"], "BUY")
+        self.assertEqual(rows[0]["filter_version"], "1.1")
+
+    # ------------------------------------------------------------------
+    # TEST 11 — nessun falso blocco: se tutti i filtri critici sono
+    # presenti (nessuno "missing"), un BUY con copertura piena deve
+    # restare BUY, mai BUY_BLOCKED.
+    # ------------------------------------------------------------------
+    def test_11_no_false_positive_buy_blocked_when_critical_fields_present(self):
+        layers = {
+            "technical": {"score": 90, "codes": [], "raw": {}},
+            "fundamental": {"score": 90, "codes": [], "raw": {"filters": [
+                {"key": "fcf", "status": "pass", "value": 1, "threshold": 0, "unit": "€"},
+                {"key": "net_debt_ebitda", "status": "pass", "value": 1, "threshold": 3, "unit": "x"},
+            ]}},
+            "bottleneck": {"score": 90, "codes": [], "raw": {}},
+            "news": {"score": 0, "codes": [], "raw": {}},
+        }
+        result = app._finalize_decision("GOODFCF", 200.0, layers, {"price": True, "fundamentals": True, "news": True})
+        self.assertEqual(result["decision"], "BUY",
+                          "TEST 11 FALLITO: con tutti i filtri critici presenti non deve mai scattare BUY_BLOCKED")
+
+    # ------------------------------------------------------------------
+    # TEST 12 — SELL deterministico: punteggio basso con copertura piena
+    # deve dare SELL, non un HOLD "prudente" che nasconderebbe il segnale.
+    # ------------------------------------------------------------------
+    def test_12_low_score_full_coverage_gives_sell(self):
+        layers = {
+            "technical": {"score": 10, "codes": [], "raw": {}},
+            "fundamental": {"score": 10, "codes": [], "raw": {"filters": [
+                {"key": "fcf", "status": "pass", "value": 1, "threshold": 0, "unit": "€"},
+                {"key": "net_debt_ebitda", "status": "pass", "value": 1, "threshold": 3, "unit": "x"},
+            ]}},
+            "bottleneck": {"score": 10, "codes": [], "raw": {}},
+            "news": {"score": 100, "codes": [], "raw": {}},
+        }
+        result = app._finalize_decision("BADCO", 50.0, layers, {"price": True, "fundamentals": True, "news": True})
+        self.assertEqual(result["decision"], "SELL")
 
 
 if __name__ == "__main__":
