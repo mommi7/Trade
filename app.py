@@ -4067,15 +4067,48 @@ nav.bottom {
 nav.bottom button {
   flex: 1;
   min-width: 0;
+  min-height: 44px;
   background: transparent;
   border-radius: 0;
   color: var(--dim);
-  padding: 8px 1px;
-  font-size: 9px;
+  padding: 8px 2px;
+  font-size: 12px;
   font-weight: 600;
-  line-height: 1.25;
+  line-height: 1.3;
 }
 nav.bottom button.active { color: var(--blue); }
+
+#nav-more-sheet {
+  position: fixed;
+  left: 0; right: 0; bottom: 58px;
+  background: var(--card);
+  border-top: 1px solid var(--border);
+  border-radius: 14px 14px 0 0;
+  box-shadow: 0 -4px 16px rgba(0,0,0,0.35);
+  display: none;
+  z-index: 50;
+  padding: 8px;
+}
+#nav-more-sheet.show { display: block; }
+#nav-more-sheet button {
+  width: 100%;
+  min-height: 44px;
+  background: transparent;
+  border-radius: 8px;
+  color: var(--text);
+  text-align: left;
+  font-size: 15px;
+  font-weight: 600;
+  padding: 10px 12px;
+}
+#nav-more-sheet button.active { color: var(--blue); background: var(--card2); }
+#nav-more-backdrop {
+  position: fixed; inset: 0;
+  background: rgba(0,0,0,0.4);
+  display: none;
+  z-index: 49;
+}
+#nav-more-backdrop.show { display: block; }
 
 .pnl-pos { color: var(--buy); }
 .pnl-neg { color: var(--sell); }
@@ -4494,15 +4527,19 @@ nav.bottom button.active { color: var(--blue); }
   </div>
 </div>
 
+<div id="nav-more-backdrop" onclick="closeMoreSheet()"></div>
+<div id="nav-more-sheet">
+  <button id="more-watchlist" onclick="showTab('watchlist')">🎯 Livelli</button>
+  <button id="more-screener25" onclick="showTab('screener25')">📅 Settimanale</button>
+  <button id="more-opportunities" onclick="showTab('opportunities')">💡 Opportunità</button>
+  <button id="more-history" onclick="showTab('history')">📜 Storico</button>
+</div>
 <nav class="bottom">
   <button id="nav-scanner" class="active" onclick="showTab('scanner')">🔍 Scanner</button>
   <button id="nav-portfolio" onclick="showTab('portfolio')">💼 Portafoglio</button>
-  <button id="nav-watchlist" onclick="showTab('watchlist')">🎯 Livelli</button>
-  <button id="nav-screener25" onclick="showTab('screener25')">📅 Settimanale</button>
   <button id="nav-bottleneck" onclick="showTab('bottleneck')">🎯 Bottleneck</button>
-  <button id="nav-opportunities" onclick="showTab('opportunities')">💡 Opportunità</button>
   <button id="nav-alerts" onclick="showTab('alerts')">🔔 Alert</button>
-  <button id="nav-history" onclick="showTab('history')">📜 Storico</button>
+  <button id="nav-more" onclick="toggleMoreSheet()">☰ Altro</button>
 </nav>
 
 <script>
@@ -4848,11 +4885,19 @@ attachTickerSuggest('pf-ticker', 'pf-suggest');
 attachTickerSuggest('al-ticker', 'al-suggest');
 attachTickerSuggest('bn-input', 'bn-suggest', (it) => analyzeBottleneckTicker());
 
+const NAV_OVERFLOW_TABS = ['watchlist', 'screener25', 'opportunities', 'history'];
+
 function showTab(name) {
   document.querySelectorAll('.tab-view').forEach(el => el.classList.remove('active'));
-  document.querySelectorAll('nav.bottom button').forEach(el => el.classList.remove('active'));
+  document.querySelectorAll('nav.bottom button, #nav-more-sheet button').forEach(el => el.classList.remove('active'));
   document.getElementById('tab-' + name).classList.add('active');
-  document.getElementById('nav-' + name).classList.add('active');
+  if (NAV_OVERFLOW_TABS.includes(name)) {
+    document.getElementById('nav-more').classList.add('active');
+    document.getElementById('more-' + name).classList.add('active');
+  } else {
+    document.getElementById('nav-' + name).classList.add('active');
+  }
+  closeMoreSheet();
   if (name === 'portfolio') { loadPortfolio(); loadVerdict(); }
   if (name === 'alerts') loadAlerts();
   if (name === 'history') loadHistory();
@@ -4860,6 +4905,16 @@ function showTab(name) {
   if (name === 'watchlist') { loadWatchlist(); loadWatchlistLog(); }
   if (name === 'screener25') loadScreener25();
   if (name === 'bottleneck') initBottleneck();
+}
+
+function toggleMoreSheet() {
+  document.getElementById('nav-more-sheet').classList.toggle('show');
+  document.getElementById('nav-more-backdrop').classList.toggle('show');
+}
+
+function closeMoreSheet() {
+  document.getElementById('nav-more-sheet').classList.remove('show');
+  document.getElementById('nav-more-backdrop').classList.remove('show');
 }
 
 function renderAnalysisCard(a, extraButtons) {
