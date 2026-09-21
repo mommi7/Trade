@@ -677,27 +677,43 @@ def fetch_market_data(ticker, errors=None):
 # da yfinance: nessuna chiave richiesta, ma i moduli possono mancare per
 # molti titoli (specie fuori USA) — ogni campo può tornare None, e questo è
 # gestito a valle come "dato non disponibile", mai come bocciatura.
-def fetch_yahoo_fundamentals(ticker):
+def _fetch_yahoo_quotesummary_once(ticker, modules):
     _warm_yahoo_session()
-    modules = (
-        "defaultKeyStatistics,financialData,summaryDetail,price,"
-        "incomeStatementHistoryQuarterly,cashflowStatementHistoryQuarterly,"
-        "recommendationTrend,calendarEvents"
-    )
-    data = None
     for base in ["query1", "query2"]:
         try:
             url = f"https://{base}.finance.yahoo.com/v10/finance/quoteSummary/{ticker}"
             r = YAHOO_SESSION.get(url, params={"modules": modules}, timeout=12)
             if r.status_code != 200:
+                print(f"Yahoo fundamentals {base} HTTP {r.status_code} per {ticker}")
                 continue
             result = r.json()["quoteSummary"]["result"]
             if not result:
                 continue
-            data = result[0]
-            break
+            return result[0]
         except Exception as e:
             print(f"Yahoo fundamentals {base} fallito per {ticker}: {e}")
+    return None
+
+
+def fetch_yahoo_fundamentals(ticker):
+    """Nessun fallback per i fondamentali (Stooq/Twelve Data non li
+    offrono nel piano gratuito): solo Yahoo. Un solo retry dopo una breve
+    pausa se il primo tentativo fallisce — stesso motivo del retry su
+    fetch_market_data (429 momentaneo al cold start di Render), ma qui
+    è ancora più importante perché non c'è una seconda fonte a cui
+    appoggiarsi: senza questo retry, Fundamental e Bottleneck restano
+    "non disponibili" ogni volta che càpita un 429 isolato, anche
+    quando il prezzo (con le sue 3 fonti) è stato recuperato senza
+    problemi."""
+    modules = (
+        "defaultKeyStatistics,financialData,summaryDetail,price,"
+        "incomeStatementHistoryQuarterly,cashflowStatementHistoryQuarterly,"
+        "recommendationTrend,calendarEvents"
+    )
+    data = _fetch_yahoo_quotesummary_once(ticker, modules)
+    if data is None:
+        time.sleep(3)
+        data = _fetch_yahoo_quotesummary_once(ticker, modules)
     if data is None:
         return None
 
@@ -785,10 +801,17 @@ _BOTTLENECK_MEM_CACHE = {}
 
 
 def get_fundamentals_cached(ticker):
-    """Cache 24h su DB (persiste tra riavvii/redeploy) + memoria di processo."""
+    """Cache 24h su DB (persiste tra riavvii/redeploy) + memoria di processo
+    — ma SOLO per un fetch riuscito. Un fetch completamente fallito (fund E
+    market entrambi None: Yahoo/Stooq/Twelve Data tutti irraggiungibili in
+    quel momento) usa una cache molto più corta (5 minuti): prima di questo
+    fix, un singolo 429 di passaggio veniva salvato come "nessun dato" per
+    24 ore intere, e Fundamental/Bottleneck restavano bloccati su "non
+    disponibile" per tutto il giorno anche se Yahoo tornava disponibile
+    pochi minuti dopo."""
     now = time.time()
     mem = _BOTTLENECK_MEM_CACHE.get(ticker)
-    if mem and now - mem["at"] < config.BOTTLENECK_CACHE_TTL_SECONDS:
+    if mem and now - mem["at"] < mem["ttl"]:
         return mem["data"]
 
     conn = get_db()
@@ -796,10 +819,16 @@ def get_fundamentals_cached(ticker):
         row = conn.execute(
             "SELECT data_json, fetched_at FROM bottleneck_cache WHERE ticker = ?", (ticker,)
         ).fetchone()
-        if row and now - row["fetched_at"] < config.BOTTLENECK_CACHE_TTL_SECONDS:
+        if row:
             fund = json.loads(row["data_json"])
-            _BOTTLENECK_MEM_CACHE[ticker] = {"data": fund, "at": row["fetched_at"]}
-            return fund
+            row_ttl = (
+                config.BOTTLENECK_CACHE_TTL_SECONDS
+                if (fund.get("fundamentals") or fund.get("market"))
+                else config.BOTTLENECK_CACHE_FAILURE_TTL_SECONDS
+            )
+            if now - row["fetched_at"] < row_ttl:
+                _BOTTLENECK_MEM_CACHE[ticker] = {"data": fund, "at": row["fetched_at"], "ttl": row_ttl}
+                return fund
 
         fund = fetch_yahoo_fundamentals(ticker)
         market = fetch_market_data(ticker)
@@ -824,7 +853,8 @@ def get_fundamentals_cached(ticker):
             (ticker, json.dumps(combined), now),
         )
         conn.commit()
-        _BOTTLENECK_MEM_CACHE[ticker] = {"data": combined, "at": now}
+        ttl = config.BOTTLENECK_CACHE_TTL_SECONDS if (fund or market) else config.BOTTLENECK_CACHE_FAILURE_TTL_SECONDS
+        _BOTTLENECK_MEM_CACHE[ticker] = {"data": combined, "at": now, "ttl": ttl}
         return combined
     finally:
         conn.close()
@@ -3066,9 +3096,12 @@ def generate_daily_verdict(send=True):
     for row in rows:
         with CACHE_LOCK:
             cached = LAST_ANALYSIS.get(row["ticker"])
-        if cached is None or "error" in cached:
+        if not cached or "error" in cached or cached.get("price") is None:
             continue
-        value = cached["price"] * row["qty"] if row["qty"] else cached["price"]
+        try:
+            value = cached["price"] * row["qty"] if row["qty"] else cached["price"]
+        except (TypeError, KeyError):
+            continue
         total_value += value
         positions.append({"row": row, "analysis": cached, "value": value})
 
@@ -3078,21 +3111,33 @@ def generate_daily_verdict(send=True):
     sector_weights = {}
     lines = []
     for p in positions:
-        ticker = p["row"]["ticker"]
-        a = p["analysis"]
-        weight = (p["value"] / total_value * 100) if total_value else 0
-        sector = SECTOR_MAP.get(ticker, "Altro")
-        sector_weights[sector] = sector_weights.get(sector, 0) + weight
-        pnl_pct = None
-        if p["row"]["qty"] and p["row"]["paid"]:
-            pnl_pct = (p["value"] - p["row"]["paid"]) / p["row"]["paid"] * 100
-        stop_txt = f", stop loss {a['stop_loss']}" if a.get("stop_loss") is not None else ""
-        pnl_txt = f"{pnl_pct:.1f}%" if pnl_pct is not None else "non disponibile"
-        lines.append(
-            f"- {ticker}: segnale {a['signal']} (score {a['score']}), prezzo {a['price']} {a['currency']}, "
-            f"peso {weight:.1f}% del portafoglio, RSI {a['rsi']}, "
-            f"distanza da max 52W {a['dist_high52']}%, P&L {pnl_txt}{stop_txt}"
-        )
+        # Un campo mancante/malformato in una singola posizione non deve far
+        # fallire l'intero verdetto (era successo: un'eccezione non gestita
+        # qui produceva un 500 HTML, e il frontend restava bloccato su
+        # "Generazione in corso…" per sempre perché non sapeva interpretare
+        # una risposta che non era JSON).
+        try:
+            ticker = p["row"]["ticker"]
+            a = p["analysis"]
+            weight = (p["value"] / total_value * 100) if total_value else 0
+            sector = SECTOR_MAP.get(ticker, "Altro")
+            sector_weights[sector] = sector_weights.get(sector, 0) + weight
+            pnl_pct = None
+            if p["row"]["qty"] and p["row"]["paid"]:
+                pnl_pct = (p["value"] - p["row"]["paid"]) / p["row"]["paid"] * 100
+            stop_txt = f", stop loss {a['stop_loss']}" if a.get("stop_loss") is not None else ""
+            pnl_txt = f"{pnl_pct:.1f}%" if pnl_pct is not None else "non disponibile"
+            lines.append(
+                f"- {ticker}: segnale {a['signal']} (score {a['score']}), prezzo {a['price']} {a['currency']}, "
+                f"peso {weight:.1f}% del portafoglio, RSI {a['rsi']}, "
+                f"distanza da max 52W {a['dist_high52']}%, P&L {pnl_txt}{stop_txt}"
+            )
+        except (KeyError, TypeError, ZeroDivisionError) as e:
+            print(f"Verdetto: posizione {p['row']['ticker']} saltata per dati incompleti: {e}")
+            continue
+
+    if not lines:
+        return {"error": "Nessuna posizione con dati sufficienti per il verdetto"}
 
     sector_lines = [f"- {s}: {w:.1f}%" for s, w in sector_weights.items()]
 
@@ -3673,7 +3718,15 @@ def api_verdict_get():
 
 @app.route("/api/verdict/refresh", methods=["POST"])
 def api_verdict_refresh():
-    result = generate_daily_verdict(send=False)
+    """Non deve MAI rispondere con qualcosa che non sia JSON: un errore non
+    previsto qui, se lasciato propagare, produce una pagina HTML di errore
+    che il frontend non sa interpretare — il testo resta bloccato su
+    "Generazione in corso…" all'infinito invece di mostrare un errore."""
+    try:
+        result = generate_daily_verdict(send=False)
+    except Exception as e:
+        print(f"Errore inatteso nel verdetto giornaliero: {e}")
+        return jsonify({"error": f"Errore inatteso: {e}"}), 500
     if "error" in result:
         return jsonify(result), 400
     return jsonify(result)
@@ -4439,7 +4492,7 @@ nav.bottom button.active { color: var(--blue); }
       <button class="secondary" onclick="refreshPortfolio()">🔄 Aggiorna prezzi</button>
       <button class="secondary" onclick="triggerPhotoImport()">📷 Importa da foto</button>
       <button onclick="toggleAddForm()">+ Aggiungi</button>
-      <input type="file" id="photo-input" accept="image/*" capture="environment" style="display:none" onchange="importPhoto(this.files[0])">
+      <input type="file" id="photo-input" accept="image/*" style="display:none" onchange="importPhoto(this.files[0])">
     </div>
     <div class="card" id="add-form" style="display:none">
       <div class="form-grid">
@@ -4863,9 +4916,13 @@ async function loadVerdict() {
 
 async function refreshVerdict() {
   document.getElementById('verdict-text').textContent = '🤖 Generazione in corso…';
-  const res = await fetch('/api/verdict/refresh', { method: 'POST' });
-  const data = await res.json();
-  document.getElementById('verdict-text').textContent = data.text || data.error || 'Errore';
+  try {
+    const res = await fetch('/api/verdict/refresh', { method: 'POST' });
+    const data = await res.json();
+    document.getElementById('verdict-text').textContent = data.text || data.error || 'Errore';
+  } catch (e) {
+    document.getElementById('verdict-text').textContent = 'Errore di rete o del server — riprova tra poco.';
+  }
 }
 
 refreshEmailUI();
@@ -5114,10 +5171,25 @@ function renderScannerResult(a, d) {
     ${wsPanel}`;
 }
 
+async function resolveTickerInput(raw) {
+  const q = (raw || '').trim();
+  if (!q) return '';
+  try {
+    const res = await fetch(`/api/search/${encodeURIComponent(q)}`);
+    const items = await res.json();
+    if (items && items.length) {
+      const exact = items.find(it => it.symbol.toUpperCase() === q.toUpperCase());
+      return (exact || items[0]).symbol;
+    }
+  } catch (e) { /* rete assente: prova comunque con il testo digitato */ }
+  return q.toUpperCase();
+}
+
 async function scanTicker() {
-  const ticker = document.getElementById('scan-input').value.trim().toUpperCase();
-  if (!ticker) return;
+  const raw = document.getElementById('scan-input').value.trim();
+  if (!raw) return;
   document.getElementById('scan-result').innerHTML = '<div class="spinner">Analisi in corso… (prezzo → tecnico → fondamentali → bottleneck → news → verifica → decisione)</div>';
+  const ticker = await resolveTickerInput(raw);
   const [scanRes, decisionRes] = await Promise.all([
     fetch(`/api/scan/${ticker}`).then(r => r.json()).catch(() => ({ ticker, error: 'Errore di rete' })),
     fetch(`/api/decisions/${ticker}`).then(r => r.json()).catch(() => null),
@@ -5602,7 +5674,15 @@ function bottleneckCard(r) {
 }
 
 async function analyzeBottleneckTicker(tickerArg, save) {
-  const ticker = (tickerArg && typeof tickerArg === 'string') ? tickerArg : document.getElementById('bn-input').value.trim();
+  let ticker;
+  if (tickerArg && typeof tickerArg === 'string') {
+    ticker = tickerArg;
+  } else {
+    const raw = document.getElementById('bn-input').value.trim();
+    if (!raw) return;
+    document.getElementById('bn-result').innerHTML = '<div class="spinner">Analisi in corso…</div>';
+    ticker = await resolveTickerInput(raw);
+  }
   if (!ticker) return;
   BN_LAST_TICKER = ticker;
   document.getElementById('bn-result').innerHTML = '<div class="spinner">Analisi in corso…</div>';

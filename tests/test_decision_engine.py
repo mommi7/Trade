@@ -16,6 +16,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch, MagicMock
 
@@ -301,6 +302,76 @@ class DecisionEngineRegressionTests(unittest.TestCase):
         }
         result = app._finalize_decision("BADCO", 50.0, layers, {"price": True, "fundamentals": True, "news": True})
         self.assertEqual(result["decision"], "SELL")
+
+    # ------------------------------------------------------------------
+    # TEST 13 — bug reale trovato in produzione: un fetch fondamentali
+    # completamente fallito (Yahoo bloccato in quel momento) veniva
+    # salvato in cache per 24 ORE come "nessun dato", bloccando
+    # Fundamental/Bottleneck su "non disponibile" tutto il giorno anche
+    # se Yahoo tornava disponibile pochi minuti dopo. Un fallimento deve
+    # usare una cache molto più corta (5 minuti) di un successo (24h).
+    # ------------------------------------------------------------------
+    def test_13_failed_fundamentals_fetch_is_not_cached_for_24h(self):
+        with patch("app.fetch_yahoo_fundamentals", return_value=None), \
+             patch("app.fetch_market_data", return_value=None), \
+             patch("app.fetch_yahoo_history", return_value=None):
+            first = app.get_fundamentals_cached("FAILCO")
+        self.assertIsNone(first["fundamentals"])
+
+        # 6 minuti dopo (oltre la cache-fallimento di 5 minuti, ben dentro
+        # le 24h di una cache normale): deve ritentare, non servire la
+        # cache vecchia.
+        app._BOTTLENECK_MEM_CACHE.pop("FAILCO", None)
+        conn = app.get_db()
+        try:
+            conn.execute("UPDATE bottleneck_cache SET fetched_at = ? WHERE ticker = 'FAILCO'",
+                         (time.time() - 360,))
+            conn.commit()
+        finally:
+            conn.close()
+
+        with patch("app.fetch_yahoo_fundamentals", return_value={"pe": 20.0}), \
+             patch("app.fetch_market_data", return_value={"price": 50, "closes": [1, 2],
+                                                            "currency": "USD", "name": "x"}), \
+             patch("app.fetch_yahoo_history", return_value=[10, 20]):
+            second = app.get_fundamentals_cached("FAILCO")
+        self.assertIsNotNone(second["fundamentals"],
+                              "TEST 13 FALLITO: la cache di un fallimento non deve durare come quella di un successo")
+
+    # ------------------------------------------------------------------
+    # TEST 14 — bug reale trovato in produzione: il Verdetto giornaliero
+    # AI restava bloccato per sempre su "Generazione in corso…" perché
+    # una posizione con una cache di analisi incompleta (campo mancante,
+    # es. da una versione precedente dell'app) faceva esplodere l'intero
+    # endpoint con un 500 HTML, che il frontend non sapeva interpretare.
+    # Una posizione con dati incompleti deve essere saltata, mai far
+    # fallire l'intera risposta.
+    # ------------------------------------------------------------------
+    def test_14_verdict_endpoint_never_crashes_on_malformed_cached_analysis(self):
+        orig_key = config.GEMINI_API_KEY
+        config.GEMINI_API_KEY = "fake-key-for-test"
+        conn = app.get_db()
+        try:
+            conn.execute("INSERT INTO tickers (ticker, qty, paid, active) VALUES ('BADCO', 10, 100, 1)")
+            conn.commit()
+        finally:
+            conn.close()
+
+        with app.CACHE_LOCK:
+            app.LAST_ANALYSIS["BADCO"] = {"price": 50.0, "currency": "USD"}  # manca signal/score/rsi/dist_high52
+
+        try:
+            client = app.app.test_client()
+            resp = client.post("/api/verdict/refresh")
+            # Qualunque sia l'esito, DEVE essere JSON valido (mai una pagina
+            # di errore HTML che lascia il frontend bloccato per sempre).
+            body = resp.get_json()
+            self.assertIsNotNone(body, "TEST 14 FALLITO: la risposta deve essere sempre JSON, mai HTML")
+            self.assertIn(resp.status_code, (200, 400, 500))
+        finally:
+            config.GEMINI_API_KEY = orig_key
+            with app.CACHE_LOCK:
+                app.LAST_ANALYSIS.pop("BADCO", None)
 
 
 if __name__ == "__main__":

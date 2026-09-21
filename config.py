@@ -273,8 +273,12 @@ BOTTLENECK_DEFAULTS = {
 DEFENSIVE_SECTORS = {"Difensivo", "Healthcare", "Salute", "Beni di consumo primari", "Utility"}
 
 # Cache locale delle fondamentali (24h) per non saturare Yahoo durante una
-# scansione dell'intero universo.
+# scansione dell'intero universo. Un fetch completamente fallito (nessuna
+# fonte ha risposto) usa una cache molto più corta: non deve bloccare
+# Fundamental/Bottleneck su "non disponibile" per un giorno intero per un
+# blocco temporaneo di qualche minuto.
 BOTTLENECK_CACHE_TTL_SECONDS = 24 * 3600
+BOTTLENECK_CACHE_FAILURE_TTL_SECONDS = 5 * 60
 
 # --------------------------------------------------------------------------
 # Motore notizie deterministico (zero AI). Ogni regola ha una severità fissa
