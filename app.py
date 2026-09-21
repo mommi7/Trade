@@ -624,7 +624,16 @@ def fetch_twelvedata(ticker):
 
 
 def fetch_market_data(ticker):
-    """Yahoo come fonte primaria, poi Stooq, poi Twelve Data (se configurata)."""
+    """Yahoo come fonte primaria, poi Stooq, poi Twelve Data (se configurata).
+    Se tutte e tre falliscono, un secondo giro dopo una breve pausa: il caso
+    più comune su Render free è un cold start (processo appena risvegliato
+    dallo sleep) che arriva insieme a un 429 momentaneo di Yahoo — spesso
+    sparisce da solo dopo pochi secondi, quindi vale la pena un solo retry
+    prima di arrendersi e mostrare "dati non disponibili"."""
+    data = fetch_yahoo(ticker) or fetch_stooq(ticker) or fetch_twelvedata(ticker)
+    if data:
+        return data
+    time.sleep(3)
     return fetch_yahoo(ticker) or fetch_stooq(ticker) or fetch_twelvedata(ticker)
 
 
