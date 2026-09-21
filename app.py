@@ -474,15 +474,20 @@ def _warm_yahoo_session():
     _yahoo_warmed = True
 
 
-def fetch_yahoo(ticker):
-    """Fetch diretto senza yfinance. Prova 2 server, torna None se falliscono entrambi."""
+def fetch_yahoo(ticker, errors=None):
+    """Fetch diretto senza yfinance. Prova 2 server, torna None se falliscono entrambi.
+    Se 'errors' è una lista, ci accoda il motivo del fallimento (visibile poi
+    nell'app invece di sparire nei log di Render che l'utente non può vedere)."""
     _warm_yahoo_session()
     for base in ["query1", "query2"]:
         try:
             url = f"https://{base}.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=2y"
             r = YAHOO_SESSION.get(url, timeout=12)
             if r.status_code != 200:
-                print(f"Yahoo {base} HTTP {r.status_code} per {ticker}: {r.text[:200]!r}")
+                msg = f"Yahoo {base} HTTP {r.status_code}"
+                print(f"{msg} per {ticker}: {r.text[:200]!r}")
+                if errors is not None:
+                    errors.append(msg)
                 continue
             j = r.json()
             result = j["chart"]["result"][0]
@@ -491,6 +496,8 @@ def fetch_yahoo(ticker):
             raw_volumes = quote.get("volume", [])
             paired = [(c, v or 0) for c, v in zip(raw_closes, raw_volumes) if c]
             if not paired:
+                if errors is not None:
+                    errors.append(f"Yahoo {base}: nessun dato storico nella risposta")
                 continue
             closes = [p[0] for p in paired]
             volumes = [p[1] for p in paired]
@@ -504,6 +511,8 @@ def fetch_yahoo(ticker):
             }
         except Exception as e:
             print(f"Yahoo {base} fallito per {ticker}: {e}")
+            if errors is not None:
+                errors.append(f"Yahoo {base}: {e}")
     return None
 
 
@@ -512,7 +521,7 @@ def is_crypto_ticker(ticker):
     return bool(re.match(r"^[A-Z0-9]{2,10}-[A-Z]{3,4}$", ticker.upper()))
 
 
-def fetch_stooq(ticker):
+def fetch_stooq(ticker, errors=None):
     """Fallback gratuito senza autenticazione, usato se Yahoo è bloccato.
     Copertura minore (soprattutto titoli USA) e niente nome/valuta precisi."""
     if is_crypto_ticker(ticker):
@@ -525,7 +534,10 @@ def fetch_stooq(ticker):
         url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
         r = requests.get(url, headers=YAHOO_HEADERS, timeout=12)
         if r.status_code != 200 or not r.text.startswith("Date,"):
-            print(f"Stooq HTTP {r.status_code} per {ticker}: {r.text[:120]!r}")
+            msg = f"Stooq HTTP {r.status_code}" if r.status_code != 200 else "Stooq: simbolo non trovato"
+            print(f"{msg} per {ticker}: {r.text[:120]!r}")
+            if errors is not None:
+                errors.append(msg)
             return None
         closes, volumes = [], []
         for line in r.text.strip().splitlines()[1:]:
@@ -539,6 +551,8 @@ def fetch_stooq(ticker):
         closes = closes[-504:]  # circa 2 anni di sedute
         volumes = volumes[-504:]
         if len(closes) < 2:
+            if errors is not None:
+                errors.append("Stooq: dati storici insufficienti")
             return None
         return {
             "closes": closes,
@@ -549,6 +563,8 @@ def fetch_stooq(ticker):
         }
     except Exception as e:
         print(f"Stooq fallito per {ticker}: {e}")
+        if errors is not None:
+            errors.append(f"Stooq: {e}")
         return None
 
 
@@ -577,11 +593,13 @@ def _throttle_twelvedata():
         _TWELVEDATA_CALL_TIMES.append(time.time())
 
 
-def fetch_twelvedata(ticker):
+def fetch_twelvedata(ticker, errors=None):
     """Terzo fallback, con API key gratuita (twelvedata.com). Usato solo se
     TWELVEDATA_API_KEY è impostata: utile quando l'hosting cloud ha l'IP
     bloccato sia da Yahoo che da Stooq (capita su alcuni piani gratuiti)."""
     if not config.TWELVEDATA_API_KEY:
+        if errors is not None:
+            errors.append("Twelve Data: TWELVEDATA_API_KEY non configurata")
         return None
     symbol = ticker.replace("-", "/") if is_crypto_ticker(ticker) else ticker
     try:
@@ -595,11 +613,17 @@ def fetch_twelvedata(ticker):
         }
         r = requests.get(url, params=params, timeout=12)
         if r.status_code != 200:
-            print(f"Twelve Data HTTP {r.status_code} per {ticker}: {r.text[:200]!r}")
+            msg = f"Twelve Data HTTP {r.status_code}"
+            print(f"{msg} per {ticker}: {r.text[:200]!r}")
+            if errors is not None:
+                errors.append(msg)
             return None
         j = r.json()
         if j.get("status") == "error" or "values" not in j:
-            print(f"Twelve Data errore per {ticker}: {j.get('message', j)}")
+            api_msg = j.get("message", str(j)[:150])
+            print(f"Twelve Data errore per {ticker}: {api_msg}")
+            if errors is not None:
+                errors.append(f"Twelve Data: {api_msg}")
             return None
         values = list(reversed(j["values"]))  # dal più vecchio al più recente
         closes, volumes = [], []
@@ -610,6 +634,8 @@ def fetch_twelvedata(ticker):
             except (TypeError, ValueError, KeyError):
                 continue
         if len(closes) < 2:
+            if errors is not None:
+                errors.append("Twelve Data: dati storici insufficienti")
             return None
         return {
             "closes": closes,
@@ -620,21 +646,29 @@ def fetch_twelvedata(ticker):
         }
     except Exception as e:
         print(f"Twelve Data fallito per {ticker}: {e}")
+        if errors is not None:
+            errors.append(f"Twelve Data: {e}")
         return None
 
 
-def fetch_market_data(ticker):
+def fetch_market_data(ticker, errors=None):
     """Yahoo come fonte primaria, poi Stooq, poi Twelve Data (se configurata).
     Se tutte e tre falliscono, un secondo giro dopo una breve pausa: il caso
     più comune su Render free è un cold start (processo appena risvegliato
     dallo sleep) che arriva insieme a un 429 momentaneo di Yahoo — spesso
     sparisce da solo dopo pochi secondi, quindi vale la pena un solo retry
-    prima di arrendersi e mostrare "dati non disponibili"."""
-    data = fetch_yahoo(ticker) or fetch_stooq(ticker) or fetch_twelvedata(ticker)
+    prima di arrendersi e mostrare "dati non disponibili". Se 'errors' è una
+    lista, viene riempita con il motivo esatto di ogni fallimento (fonte per
+    fonte), così l'app può mostrarlo invece del generico "dati non
+    disponibili" — niente più bisogno di controllare i log di Render a mano
+    per capire cosa è successo."""
+    data = fetch_yahoo(ticker, errors) or fetch_stooq(ticker, errors) or fetch_twelvedata(ticker, errors)
     if data:
         return data
     time.sleep(3)
-    return fetch_yahoo(ticker) or fetch_stooq(ticker) or fetch_twelvedata(ticker)
+    if errors is not None:
+        errors.append("--- ritento dopo 3s ---")
+    return fetch_yahoo(ticker, errors) or fetch_stooq(ticker, errors) or fetch_twelvedata(ticker, errors)
 
 
 # --------------------------------------------------------------------------
@@ -1660,9 +1694,11 @@ def compute_signal(closes, price, custom_buy=None, custom_sell=None, volumes=Non
 def analyze_ticker(ticker, custom_buy=None, custom_sell=None):
     """Recupera i dati e calcola il segnale per un ticker. Non solleva mai eccezioni."""
     try:
-        data = fetch_market_data(ticker)
+        errors = []
+        data = fetch_market_data(ticker, errors)
         if not data or len(data["closes"]) < 2:
-            return {"ticker": ticker, "error": f"Impossibile recuperare dati per {ticker}"}
+            detail = " — " + "; ".join(errors[-4:]) if errors else ""
+            return {"ticker": ticker, "error": f"Impossibile recuperare dati per {ticker}{detail}"}
 
         sig = compute_signal(
             data["closes"], data["price"], custom_buy, custom_sell, data.get("volumes")
