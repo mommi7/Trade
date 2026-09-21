@@ -204,6 +204,13 @@ def init_db():
             checked_12m INTEGER DEFAULT 0,
             outcome TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS provider_usage (
+            provider TEXT,
+            day TEXT,
+            calls INTEGER DEFAULT 0,
+            PRIMARY KEY (provider, day)
+        );
         """
     )
     conn.commit()
@@ -593,6 +600,55 @@ def _throttle_twelvedata():
         _TWELVEDATA_CALL_TIMES.append(time.time())
 
 
+# --------------------------------------------------------------------------
+# Twelve Data credit budget — il piano gratuito è 800 crediti/giorno (visto
+# in produzione: 807/800, quota esaurita). Senza un limite lato nostro,
+# l'app continua a mandare richieste che tornano 429 fino a fine giornata,
+# sprecando tempo/retry per niente. Un conteggio persistito su DB (giorno
+# UTC, sopravvive a riavvii/redeploy) permette di fermarsi PRIMA di
+# sprecare l'ultimo margine di quota, e passare subito al fallback
+# successivo invece di ritentare Twelve Data alla cieca.
+_PROVIDER_USAGE_LOCK = threading.Lock()
+
+
+def _today_utc():
+    return datetime.utcnow().strftime("%Y-%m-%d")
+
+
+def get_provider_usage_today(provider):
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT calls FROM provider_usage WHERE provider = ? AND day = ?",
+            (provider, _today_utc()),
+        ).fetchone()
+        return row["calls"] if row else 0
+    finally:
+        conn.close()
+
+
+def _record_provider_usage(provider):
+    with _PROVIDER_USAGE_LOCK:
+        conn = get_db()
+        try:
+            conn.execute(
+                "INSERT INTO provider_usage (provider, day, calls) VALUES (?, ?, 1) "
+                "ON CONFLICT(provider, day) DO UPDATE SET calls = calls + 1",
+                (provider, _today_utc()),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def twelvedata_budget_ok():
+    """False se siamo già al/oltre il margine di sicurezza della quota
+    giornaliera: a quel punto continuare a chiamare Twelve Data produce solo
+    altri 429 e brucia margine inutilmente — meglio saltare dritti al
+    prossimo fallback (o al messaggio di dati non disponibili)."""
+    return get_provider_usage_today("twelvedata") < config.TWELVEDATA_DAILY_BUDGET
+
+
 def fetch_twelvedata(ticker, errors=None):
     """Terzo fallback, con API key gratuita (twelvedata.com). Usato solo se
     TWELVEDATA_API_KEY è impostata: utile quando l'hosting cloud ha l'IP
@@ -601,9 +657,14 @@ def fetch_twelvedata(ticker, errors=None):
         if errors is not None:
             errors.append("Twelve Data: TWELVEDATA_API_KEY non configurata")
         return None
+    if not twelvedata_budget_ok():
+        if errors is not None:
+            errors.append("Twelve Data: budget giornaliero esaurito, salto la richiesta")
+        return None
     symbol = ticker.replace("-", "/") if is_crypto_ticker(ticker) else ticker
     try:
         _throttle_twelvedata()
+        _record_provider_usage("twelvedata")
         url = "https://api.twelvedata.com/time_series"
         params = {
             "symbol": symbol,
@@ -3442,6 +3503,24 @@ def api_cron_tick():
 @app.route("/api/cron/tick/status", methods=["GET"])
 def api_cron_tick_status():
     return jsonify(_TICK_STATE)
+
+
+@app.route("/api/health/providers", methods=["GET"])
+def api_health_providers():
+    """Stato essenziale delle fonti dati esterne — pensato per capire in un
+    secondo, senza dover controllare la dashboard di Twelve Data, se la
+    quota giornaliera si sta avvicinando al limite."""
+    td_used = get_provider_usage_today("twelvedata")
+    return jsonify({
+        "twelvedata": {
+            "configured": bool(config.TWELVEDATA_API_KEY),
+            "used_today": td_used,
+            "budget": config.TWELVEDATA_DAILY_BUDGET,
+            "budget_ok": twelvedata_budget_ok(),
+        },
+        "gemini": {"configured": bool(config.GEMINI_API_KEY)},
+        "telegram": {"configured": bool(config.TELEGRAM_BOT_TOKEN)},
+    })
 
 
 # --------------------------------------------------------------------------

@@ -373,6 +373,33 @@ class DecisionEngineRegressionTests(unittest.TestCase):
             with app.CACHE_LOCK:
                 app.LAST_ANALYSIS.pop("BADCO", None)
 
+    # ------------------------------------------------------------------
+    # TEST 15 — bug reale trovato in produzione: la quota giornaliera
+    # gratuita di Twelve Data (800/giorno) veniva superata (807/800 visto
+    # in dashboard) perché l'app continuava a mandare richieste che
+    # tornavano comunque 429 fino a fine giornata. Il budget manager deve
+    # fermare le richieste PRIMA di superare la soglia di sicurezza, senza
+    # fare alcuna chiamata di rete quando il budget è esaurito.
+    # ------------------------------------------------------------------
+    def test_15_twelvedata_stops_before_daily_budget_exceeded(self):
+        self.assertTrue(app.twelvedata_budget_ok())
+        for _ in range(config.TWELVEDATA_DAILY_BUDGET):
+            app._record_provider_usage("twelvedata")
+        self.assertFalse(app.twelvedata_budget_ok(),
+                          "TEST 15 FALLITO: il budget deve considerarsi esaurito alla soglia configurata")
+
+        orig_key = config.TWELVEDATA_API_KEY
+        config.TWELVEDATA_API_KEY = "fake-key-for-test"
+        try:
+            with patch("app.requests.get") as mock_get:
+                errors = []
+                result = app.fetch_twelvedata("MU", errors)
+            mock_get.assert_not_called()
+            self.assertIsNone(result)
+            self.assertTrue(any("budget" in e.lower() for e in errors))
+        finally:
+            config.TWELVEDATA_API_KEY = orig_key
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

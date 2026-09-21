@@ -33,6 +33,12 @@ PUBLIC_URL = os.environ.get("CECCHINO_PUBLIC_URL", "http://localhost:5000")
 # 800 richieste/giorno). Lasciala vuota per non usarla.
 TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY", "")
 
+# Margine di sicurezza sotto il tetto reale (800/giorno sul piano free):
+# visto in produzione arrivare a 807/800 (quota superata) perché l'app
+# continuava a mandare richieste che tornavano comunque 429. Fermandosi
+# prima si evita di sprecare le ultime chiamate utili in retry falliti.
+TWELVEDATA_DAILY_BUDGET = 750
+
 # Commento AI opzionale sopra ogni segnale (facoltativo). Usa la API
 # gratuita di Google Gemini (https://aistudio.google.com/apikey — free
 # tier senza carta di credito). Lasciala vuota per non usarla: l'app
