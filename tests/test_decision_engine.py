@@ -16,8 +16,10 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import time
 import unittest
+from datetime import datetime
 from unittest.mock import patch, MagicMock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -454,6 +456,84 @@ class DecisionEngineRegressionTests(unittest.TestCase):
             self.assertIsNone(result2)
         finally:
             config.TWELVEDATA_API_KEY = orig_key
+
+    # ------------------------------------------------------------------
+    # TEST 18 — audit Twelve Data: fetch_market_data deve avere una cache
+    # breve. Una seconda richiesta per lo stesso ticker entro il TTL non
+    # deve fare NESSUNA chiamata di rete, nemmeno a Yahoo (audit: prima di
+    # questo fix un solo tick chiedeva lo stesso ticker 3-4 volte senza
+    # alcuna cache in mezzo).
+    # ------------------------------------------------------------------
+    def test_18_price_cache_avoids_duplicate_network_call(self):
+        app._PRICE_CACHE.clear()
+        app._PRICE_INFLIGHT.clear()
+        fake_data = {"closes": [1, 2, 3], "volumes": [1, 1, 1], "price": 100.0,
+                     "currency": "USD", "name": "Mock"}
+        with patch("app.fetch_yahoo", return_value=fake_data) as mock_yahoo:
+            r1 = app.fetch_market_data("MU")
+            r2 = app.fetch_market_data("MU")
+        self.assertEqual(mock_yahoo.call_count, 1,
+                          "TEST 18 FALLITO: la seconda chiamata entro il TTL deve usare la cache")
+        self.assertEqual(r1, r2)
+
+    # ------------------------------------------------------------------
+    # TEST 19 — audit Twelve Data: richieste concorrenti per lo stesso
+    # ticker (es. un passo del tick e una ricerca dell'utente nello stesso
+    # istante) devono deduplicarsi: una sola richiesta di rete parte, le
+    # altre aspettano e riusano il risultato.
+    # ------------------------------------------------------------------
+    def test_19_concurrent_requests_for_same_ticker_deduplicated(self):
+        app._PRICE_CACHE.clear()
+        app._PRICE_INFLIGHT.clear()
+        call_count = {"n": 0}
+        count_lock = threading.Lock()
+
+        def slow_fetch(ticker, errors=None):
+            with count_lock:
+                call_count["n"] += 1
+            time.sleep(0.3)
+            return {"closes": [1, 2, 3], "volumes": [1, 1, 1], "price": 100.0,
+                    "currency": "USD", "name": "Mock"}
+
+        results = []
+        results_lock = threading.Lock()
+
+        def worker():
+            r = app.fetch_market_data("ORCL")
+            with results_lock:
+                results.append(r)
+
+        with patch("app.fetch_yahoo", side_effect=slow_fetch):
+            threads = [threading.Thread(target=worker) for _ in range(5)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+        self.assertEqual(call_count["n"], 1,
+                          "TEST 19 FALLITO: 5 richieste concorrenti per lo stesso ticker devono produrre 1 sola chiamata di rete")
+        self.assertEqual(len(results), 5)
+        self.assertTrue(all(r == results[0] for r in results))
+        self.assertEqual(len(app._PRICE_INFLIGHT), 0,
+                          "TEST 19 FALLITO: la entry in-flight deve essere ripulita dopo il completamento")
+
+    # ------------------------------------------------------------------
+    # TEST 20 — audit Twelve Data: run_market_screener (scansione bulk
+    # ~30 titoli) non deve girare a ogni chiamata automatica — solo la
+    # prima volta o dopo config.MARKET_SCREENER_MIN_INTERVAL_SECONDS.
+    # Il refresh manuale (force=True) deve invece girare sempre.
+    # ------------------------------------------------------------------
+    def test_20_market_screener_throttled_unless_forced(self):
+        app.SCREENER_CACHE["results"] = [{"ticker": "PREV"}]
+        app.SCREENER_CACHE["updated"] = datetime.now().isoformat(timespec="seconds")
+        with patch("app.analyze_ticker") as mock_analyze:
+            result = app.run_market_screener(send_email=False)
+        mock_analyze.assert_not_called()
+        self.assertEqual(result, [{"ticker": "PREV"}])
+
+        with patch("app.analyze_ticker", return_value={"error": "n/d"}) as mock_analyze:
+            app.run_market_screener(send_email=False, force=True)
+        mock_analyze.assert_called()
 
 
 if __name__ == "__main__":

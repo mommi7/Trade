@@ -486,15 +486,69 @@ def _warm_yahoo_session():
     _yahoo_warmed = True
 
 
+# --------------------------------------------------------------------------
+# Metriche provider/cache — solo osservabilità, nessun impatto sulle
+# decisioni. In memoria di processo (si azzerano a un redeploy, come
+# _TWELVEDATA_CALL_TIMES): servono a capire in tempo reale dove va la
+# quota, non a essere uno storico permanente.
+# --------------------------------------------------------------------------
+_METRICS_LOCK = threading.Lock()
+_METRICS = {
+    "price_cache_hits": 0,
+    "price_cache_misses": 0,
+    "fundamentals_cache_hits": 0,
+    "fundamentals_cache_misses": 0,
+    "provider_calls": {"yahoo": 0, "stooq": 0, "twelvedata": 0},
+    "provider_429": {"yahoo": 0, "stooq": 0, "twelvedata": 0},
+    "provider_latency_total": {"yahoo": 0.0, "stooq": 0.0, "twelvedata": 0.0},
+    "fallback_count": 0,
+    "last_429": {"yahoo": None, "stooq": None, "twelvedata": None},
+}
+
+
+def _record_cache_metric(kind, hit):
+    with _METRICS_LOCK:
+        _METRICS[f"{kind}_cache_{'hits' if hit else 'misses'}"] += 1
+
+
+def _record_provider_call(provider, latency, status_code=None):
+    with _METRICS_LOCK:
+        _METRICS["provider_calls"][provider] += 1
+        _METRICS["provider_latency_total"][provider] += latency
+        if status_code == 429:
+            _METRICS["provider_429"][provider] += 1
+            _METRICS["last_429"][provider] = datetime.now().isoformat(timespec="seconds")
+
+
+def get_metrics_snapshot():
+    with _METRICS_LOCK:
+        snap = json.loads(json.dumps(_METRICS))  # copia semplice, evita riferimenti condivisi
+    for provider in ("yahoo", "stooq", "twelvedata"):
+        calls = snap["provider_calls"][provider]
+        total_latency = snap["provider_latency_total"].pop(provider)
+        snap.setdefault("provider_avg_latency_ms", {})[provider] = (
+            round(total_latency / calls * 1000, 1) if calls else None
+        )
+    price_total = snap["price_cache_hits"] + snap["price_cache_misses"]
+    fund_total = snap["fundamentals_cache_hits"] + snap["fundamentals_cache_misses"]
+    snap["price_cache_hit_rate_pct"] = round(snap["price_cache_hits"] / price_total * 100, 1) if price_total else None
+    snap["fundamentals_cache_hit_rate_pct"] = (
+        round(snap["fundamentals_cache_hits"] / fund_total * 100, 1) if fund_total else None
+    )
+    return snap
+
+
 def fetch_yahoo(ticker, errors=None):
     """Fetch diretto senza yfinance. Prova 2 server, torna None se falliscono entrambi.
     Se 'errors' è una lista, ci accoda il motivo del fallimento (visibile poi
     nell'app invece di sparire nei log di Render che l'utente non può vedere)."""
     _warm_yahoo_session()
     for base in ["query1", "query2"]:
+        t0 = time.time()
         try:
             url = f"https://{base}.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=2y"
             r = YAHOO_SESSION.get(url, timeout=12)
+            _record_provider_call("yahoo", time.time() - t0, r.status_code)
             if r.status_code != 200:
                 msg = f"Yahoo {base} HTTP {r.status_code}"
                 print(f"{msg} per {ticker}: {r.text[:200]!r}")
@@ -543,8 +597,10 @@ def fetch_stooq(ticker, errors=None):
         if "." not in symbol:
             symbol += ".us"
     try:
+        t0 = time.time()
         url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
         r = requests.get(url, headers=YAHOO_HEADERS, timeout=12)
+        _record_provider_call("stooq", time.time() - t0, r.status_code)
         if r.status_code != 200 or not r.text.startswith("Date,"):
             msg = f"Stooq HTTP {r.status_code}" if r.status_code != 200 else "Stooq: simbolo non trovato"
             print(f"{msg} per {ticker}: {r.text[:120]!r}")
@@ -710,6 +766,7 @@ def fetch_twelvedata(ticker, errors=None):
     try:
         _throttle_twelvedata()
         _record_provider_usage("twelvedata")
+        t0 = time.time()
         url = "https://api.twelvedata.com/time_series"
         params = {
             "symbol": symbol,
@@ -718,6 +775,7 @@ def fetch_twelvedata(ticker, errors=None):
             "apikey": config.TWELVEDATA_API_KEY,
         }
         r = requests.get(url, params=params, timeout=12)
+        _record_provider_call("twelvedata", time.time() - t0, r.status_code)
         if r.status_code == 429:
             _circuit_trip("twelvedata", config.TWELVEDATA_CIRCUIT_COOLDOWN_SECONDS)
             msg = "Twelve Data HTTP 429 — circuit breaker attivato"
@@ -764,32 +822,105 @@ def fetch_twelvedata(ticker, errors=None):
         return None
 
 
-def fetch_market_data(ticker, errors=None, use_twelvedata=True):
-    """Yahoo come fonte primaria, poi Stooq, poi Twelve Data (se configurata
-    e se use_twelvedata=True). Se tutte falliscono, un secondo giro dopo una
-    breve pausa: il caso più comune su Render free è un cold start (processo
-    appena risvegliato dallo sleep) che arriva insieme a un 429 momentaneo
-    di Yahoo — spesso sparisce da solo dopo pochi secondi, quindi vale la
-    pena un solo retry prima di arrendersi e mostrare "dati non disponibili".
-    Se 'errors' è una lista, viene riempita con il motivo esatto di ogni
-    fallimento (fonte per fonte), così l'app può mostrarlo invece del
-    generico "dati non disponibili".
-
-    use_twelvedata=False per le scansioni periodiche su decine di titoli
-    (Opportunità, Scansiona universo): quella quota va riservata alle
-    ricerche dirette dell'utente (Scanner/Bottleneck "Analizza", portafoglio)
-    — è lì che un 429 si vede subito sullo schermo, non in una scansione
-    automatica in background."""
+def _fetch_market_data_live(ticker, errors=None, use_twelvedata=True):
+    """La vera catena di fetch: Yahoo, poi Stooq, poi Twelve Data (se
+    configurata e se use_twelvedata=True). Se tutte falliscono, un secondo
+    giro dopo una breve pausa: il caso più comune su Render free è un cold
+    start (processo appena risvegliato dallo sleep) che arriva insieme a un
+    429 momentaneo di Yahoo — spesso sparisce da solo dopo pochi secondi.
+    Nessuna cache qui: la aggiunge fetch_market_data sopra a questa."""
     def _td(t, e):
         return fetch_twelvedata(t, e) if use_twelvedata else None
 
     data = fetch_yahoo(ticker, errors) or fetch_stooq(ticker, errors) or _td(ticker, errors)
     if data:
         return data
+    with _METRICS_LOCK:
+        _METRICS["fallback_count"] += 1
     time.sleep(3)
     if errors is not None:
         errors.append("--- ritento dopo 3s ---")
     return fetch_yahoo(ticker, errors) or fetch_stooq(ticker, errors) or _td(ticker, errors)
+
+
+_PRICE_CACHE_LOCK = threading.Lock()
+_PRICE_CACHE = {}
+_PRICE_INFLIGHT = {}
+
+
+def fetch_market_data(ticker, errors=None, use_twelvedata=True):
+    """Prezzo/OHLCV con cache breve (config.PRICE_CACHE_TTL_SECONDS) e
+    deduplica delle richieste in corso: se più componenti (un passo del
+    tick, lo Scanner, il portafoglio) chiedono lo stesso ticker nella
+    stessa finestra, parte UNA sola richiesta di rete verso Yahoo/Stooq/
+    Twelve Data — le altre aspettano il risultato invece di duplicarla.
+    Prima di questo fix, un solo tick poteva richiedere lo stesso ticker
+    3-4 volte (refresh_all_portfolio, check_watch_levels, Decision Engine)
+    senza alcuna cache in mezzo.
+
+    Se 'errors' è una lista, viene riempita con il motivo esatto di ogni
+    fallimento. use_twelvedata=False per le scansioni periodiche su decine
+    di titoli (Opportunità, Scansiona universo): quella quota va riservata
+    alle ricerche dirette dell'utente (Scanner/Bottleneck "Analizza",
+    portafoglio) — è lì che un 429 si vede subito sullo schermo, non in una
+    scansione automatica in background. La cache è tenuta separata per
+    use_twelvedata: un fallimento di una scansione bulk (senza Twelve Data)
+    non deve mai essere servito a una ricerca diretta che invece lo
+    consentirebbe."""
+    cache_key = (ticker, use_twelvedata)
+    now = time.time()
+
+    with _PRICE_CACHE_LOCK:
+        cached = _PRICE_CACHE.get(cache_key)
+        if cached and now - cached["at"] < config.PRICE_CACHE_TTL_SECONDS:
+            am_leader = None  # cache hit, nessuna richiesta da fare
+        else:
+            event = _PRICE_INFLIGHT.get(cache_key)
+            if event is None:
+                event = threading.Event()
+                _PRICE_INFLIGHT[cache_key] = event
+                am_leader = True
+            else:
+                am_leader = False
+
+    if am_leader is None:
+        _record_cache_metric("price", True)
+        if errors is not None and cached["errors"]:
+            errors.extend(cached["errors"])
+        return cached["data"]
+
+    if not am_leader:
+        event.wait(timeout=25)
+        with _PRICE_CACHE_LOCK:
+            cached = _PRICE_CACHE.get(cache_key)
+        if cached and now - cached["at"] < config.PRICE_CACHE_TTL_SECONDS + 25:
+            _record_cache_metric("price", True)
+            if errors is not None and cached["errors"]:
+                errors.extend(cached["errors"])
+            return cached["data"]
+        # La richiesta in-flight non ha prodotto un risultato in tempo
+        # (raro): procede comunque con un fetch proprio, piuttosto che
+        # restare bloccata all'infinito.
+        _record_cache_metric("price", False)
+        return _fetch_market_data_live(ticker, errors, use_twelvedata)
+
+    _record_cache_metric("price", False)
+    own_errors = []
+    data = None  # inizializzato prima del try: se _fetch_market_data_live
+    # solleva un'eccezione inattesa, il finally sotto non deve mai fallire
+    # per una variabile non assegnata — altrimenti l'evento non verrebbe
+    # mai sbloccato e ogni thread in attesa resterebbe bloccato 25s a vuoto,
+    # con la entry in _PRICE_INFLIGHT mai ripulita.
+    try:
+        data = _fetch_market_data_live(ticker, own_errors, use_twelvedata)
+    finally:
+        with _PRICE_CACHE_LOCK:
+            _PRICE_CACHE[cache_key] = {"data": data, "errors": own_errors, "at": time.time()}
+            _PRICE_INFLIGHT.pop(cache_key, None)
+        event.set()
+    if errors is not None:
+        errors.extend(own_errors)
+    return data
 
 
 # --------------------------------------------------------------------------
@@ -921,7 +1052,39 @@ def fetch_yahoo_history(ticker, rng="3y"):
 _BOTTLENECK_MEM_CACHE = {}
 
 
+_FUNDAMENTALS_INFLIGHT_LOCK = threading.Lock()
+_FUNDAMENTALS_INFLIGHT = {}
+
+
 def get_fundamentals_cached(ticker, use_twelvedata=True):
+    """Deduplica le richieste in corso sopra alla cache vera e propria
+    (_get_fundamentals_cached_impl): se due componenti chiedono lo stesso
+    ticker nello stesso istante (es. una scansione bulk e una ricerca
+    diretta dell'utente), parte un solo fetch, il secondo aspetta e riusa
+    il risultato invece di duplicarlo."""
+    cache_key = (ticker, use_twelvedata)
+    with _FUNDAMENTALS_INFLIGHT_LOCK:
+        event = _FUNDAMENTALS_INFLIGHT.get(cache_key)
+        if event is None:
+            event = threading.Event()
+            _FUNDAMENTALS_INFLIGHT[cache_key] = event
+            am_leader = True
+        else:
+            am_leader = False
+
+    if not am_leader:
+        event.wait(timeout=30)
+        return _get_fundamentals_cached_impl(ticker, use_twelvedata)
+
+    try:
+        return _get_fundamentals_cached_impl(ticker, use_twelvedata)
+    finally:
+        with _FUNDAMENTALS_INFLIGHT_LOCK:
+            _FUNDAMENTALS_INFLIGHT.pop(cache_key, None)
+        event.set()
+
+
+def _get_fundamentals_cached_impl(ticker, use_twelvedata=True):
     """Cache 24h su DB (persiste tra riavvii/redeploy) + memoria di processo
     — ma SOLO per un fetch riuscito. Un fetch completamente fallito (fund E
     market entrambi None: Yahoo/Stooq/Twelve Data tutti irraggiungibili in
@@ -934,6 +1097,7 @@ def get_fundamentals_cached(ticker, use_twelvedata=True):
     now = time.time()
     mem = _BOTTLENECK_MEM_CACHE.get(ticker)
     if mem and now - mem["at"] < mem["ttl"]:
+        _record_cache_metric("fundamentals", True)
         return mem["data"]
 
     conn = get_db()
@@ -950,8 +1114,10 @@ def get_fundamentals_cached(ticker, use_twelvedata=True):
             )
             if now - row["fetched_at"] < row_ttl:
                 _BOTTLENECK_MEM_CACHE[ticker] = {"data": fund, "at": row["fetched_at"], "ttl": row_ttl}
+                _record_cache_metric("fundamentals", True)
                 return fund
 
+        _record_cache_metric("fundamentals", False)
         fund = fetch_yahoo_fundamentals(ticker)
         market = fetch_market_data(ticker, use_twelvedata=use_twelvedata)
         history_3y = fetch_yahoo_history(ticker, "3y")
@@ -2327,10 +2493,28 @@ def notify_opportunities(results):
     broadcast(subject, body)
 
 
-def run_market_screener(send_email=True):
+def run_market_screener(send_email=True, force=False):
     """Scansiona BOTTLENECK_UNIVERSE (titoli non già in portafoglio) e tiene
     i migliori segnali BUY (score >= 40). Aggiorna sempre la cache per la UI;
-    manda una mail digest al massimo una volta al giorno per non spammare."""
+    manda una mail digest al massimo una volta al giorno per non spammare.
+
+    Audit: girava a OGNI tick automatico (nessun throttle), martellando
+    Yahoo/Stooq per ~30 titoli non in portafoglio più volte all'ora. Ora si
+    salta se l'ultima scansione è più recente di
+    config.MARKET_SCREENER_MIN_INTERVAL_SECONDS, salvo force=True (il
+    pulsante "Aggiorna" manuale dell'utente lo ignora sempre)."""
+    if not force:
+        with CACHE_LOCK:
+            last_updated = SCREENER_CACHE.get("updated")
+        if last_updated:
+            try:
+                last_dt = datetime.fromisoformat(last_updated)
+                if (datetime.now() - last_dt).total_seconds() < config.MARKET_SCREENER_MIN_INTERVAL_SECONDS:
+                    with CACHE_LOCK:
+                        return SCREENER_CACHE["results"]
+            except (ValueError, TypeError):
+                pass
+
     conn = get_db()
     try:
         active_tickers = {
@@ -2381,12 +2565,14 @@ def run_market_screener(send_email=True):
 # --------------------------------------------------------------------------
 # Screener settimanale a 25 titoli con regole operative (tab "📅 Settimanale")
 # --------------------------------------------------------------------------
-def analyze_for_screener(ticker):
+def analyze_for_screener(ticker, use_twelvedata=True):
     """Prezzo/RSI/medie/variazioni per il motore a regole. A differenza di
     analyze_ticker() calcola anche la variazione a 5 giorni (regola 1,
     anti-inseguimento) e non converte in €: qui i livelli sono in valuta
-    nativa (USD per quasi tutti), come scritti dall'utente."""
-    data = fetch_market_data(ticker)
+    nativa (USD per quasi tutti), come scritti dall'utente. use_twelvedata
+    è False per i titoli category="watchlist"/"excluded" (non posseduti):
+    la quota Twelve Data resta riservata a quelli "owned"."""
+    data = fetch_market_data(ticker, use_twelvedata=use_twelvedata)
     if not data or len(data["closes"]) < 6:
         return None
     closes = data["closes"]
@@ -3111,7 +3297,7 @@ def run_weekly_screener(send=True, force=False):
             })
             continue
         try:
-            analysis = analyze_for_screener(spec["ticker"])
+            analysis = analyze_for_screener(spec["ticker"], use_twelvedata=(spec["category"] == "owned"))
         except Exception as e:
             print(f"Errore screener settimanale per {spec['ticker']}: {e}")
             analysis = None
@@ -3574,19 +3760,48 @@ def api_cron_tick_status():
 def api_health_providers():
     """Stato essenziale delle fonti dati esterne — pensato per capire in un
     secondo, senza dover controllare la dashboard di Twelve Data, se la
-    quota giornaliera si sta avvicinando al limite."""
+    quota giornaliera si sta avvicinando al limite. Le metriche (chiamate,
+    cache hit rate, 429, latenza) sono in memoria di processo: si azzerano
+    a ogni redeploy, sono osservabilità del momento, non uno storico."""
     td_used = get_provider_usage_today("twelvedata")
     circuit_until = _circuit_blocked_until("twelvedata")
     circuit_seconds_left = round(circuit_until - time.time()) if circuit_until and circuit_until > time.time() else 0
+    metrics = get_metrics_snapshot()
     return jsonify({
         "twelvedata": {
             "configured": bool(config.TWELVEDATA_API_KEY),
             "used_today": td_used,
+            "estimated_credits_today": td_used,  # 1 credito per chiamata time_series
             "budget": config.TWELVEDATA_DAILY_BUDGET,
             "budget_ok": twelvedata_budget_ok(),
-            "circuit_ok": twelvedata_circuit_ok(),
-            "circuit_seconds_left": circuit_seconds_left,
+            "circuit_breaker": not twelvedata_circuit_ok(),
+            "cooldown_remaining_seconds": circuit_seconds_left,
+            "api_calls_today": metrics["provider_calls"]["twelvedata"],
+            "count_429": metrics["provider_429"]["twelvedata"],
+            "last_429": metrics["last_429"]["twelvedata"],
+            "avg_latency_ms": metrics["provider_avg_latency_ms"]["twelvedata"],
         },
+        "yahoo": {
+            "api_calls_today": metrics["provider_calls"]["yahoo"],
+            "count_429": metrics["provider_429"]["yahoo"],
+            "last_429": metrics["last_429"]["yahoo"],
+            "avg_latency_ms": metrics["provider_avg_latency_ms"]["yahoo"],
+        },
+        "stooq": {
+            "api_calls_today": metrics["provider_calls"]["stooq"],
+            "count_429": metrics["provider_429"]["stooq"],
+            "last_429": metrics["last_429"]["stooq"],
+            "avg_latency_ms": metrics["provider_avg_latency_ms"]["stooq"],
+        },
+        "cache": {
+            "price_cache_hit_rate_pct": metrics["price_cache_hit_rate_pct"],
+            "price_cache_hits": metrics["price_cache_hits"],
+            "price_cache_misses": metrics["price_cache_misses"],
+            "fundamentals_cache_hit_rate_pct": metrics["fundamentals_cache_hit_rate_pct"],
+            "fundamentals_cache_hits": metrics["fundamentals_cache_hits"],
+            "fundamentals_cache_misses": metrics["fundamentals_cache_misses"],
+        },
+        "fallback_count": metrics["fallback_count"],
         "gemini": {"configured": bool(config.GEMINI_API_KEY)},
         "telegram": {"configured": bool(config.TELEGRAM_BOT_TOKEN)},
     })
@@ -4059,7 +4274,7 @@ def api_opportunities_list():
 
 @app.route("/api/opportunities/refresh", methods=["POST"])
 def api_opportunities_refresh():
-    top = run_market_screener(send_email=False)
+    top = run_market_screener(send_email=False, force=True)
     return jsonify({"results": top, "updated": SCREENER_CACHE["updated"]})
 
 

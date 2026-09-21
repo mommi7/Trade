@@ -45,6 +45,19 @@ TWELVEDATA_DAILY_BUDGET = 750
 # da zero, ma la quota reale lato Twelve Data può essere ancora esaurita).
 TWELVEDATA_CIRCUIT_COOLDOWN_SECONDS = 30 * 60
 
+# Cache brevissima su prezzo/OHLCV (audit: un solo tick chiedeva lo stesso
+# ticker 3-4 volte — refresh_all_portfolio, check_watch_levels, Decision
+# Engine — senza nessuna cache in mezzo). 5 minuti: abbastanza per
+# eliminare i duplicati interni a un singolo tick, abbastanza breve da
+# restare "prezzo quasi in tempo reale" per l'utente.
+PRICE_CACHE_TTL_SECONDS = 5 * 60
+
+# Le scansioni bulk sull'universo (Opportunità: ~30 titoli non in
+# portafoglio) non hanno throttle: ripartivano da zero a ogni tick
+# automatico, martellando Yahoo/Stooq indipendentemente da Twelve Data.
+# Il refresh manuale dalla UI ("Aggiorna") ignora questo limite.
+MARKET_SCREENER_MIN_INTERVAL_SECONDS = 60 * 60
+
 # Commento AI opzionale sopra ogni segnale (facoltativo). Usa la API
 # gratuita di Google Gemini (https://aistudio.google.com/apikey — free
 # tier senza carta di credito). Lasciala vuota per non usarla: l'app
