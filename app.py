@@ -1720,20 +1720,12 @@ def broadcast(subject, body):
     send_telegram(f"{subject}\n\n{body}")
 
 
-def notify_signal_change(ticker, old_signal, new_result):
-    subject = f"🎯 CECCHINO: {ticker} {old_signal} → {new_result['signal']}"
-    reasons_txt = "\n".join(f"• {r}" for r in new_result["reasons"])
-    body = (
-        f"Ticker: {ticker}\n"
-        f"Vecchio segnale: {old_signal}\n"
-        f"Nuovo segnale: {new_result['signal']}\n"
-        f"Prezzo: {new_result['price']} {new_result['currency']}\n"
-        f"RSI: {new_result['rsi']}\n"
-        f"Score: {new_result['score']}\n"
-        f"Motivazioni:\n{reasons_txt}\n\n"
-        f"Apri Cecchino: {config.PUBLIC_URL}"
-    )
-    broadcast(subject, body)
+# notify_signal_change è stata rimossa: mandava un alert Telegram/mail
+# indipendente basato solo sul segnale tecnico, in parallelo a
+# notify_decision_change (Decision Engine) — potevano arrivare due
+# messaggi diversi per lo stesso ticker (es. tecnico "BUY", Decision
+# Engine "HOLD" per copertura dati insufficiente). Ora l'unica fonte di
+# alert è il Decision Engine, l'unica decisione autorevole dell'app.
 
 
 def notify_alert(ticker, condition, threshold, price):
@@ -1829,7 +1821,11 @@ def check_trailing_stop(conn, ticker, price):
 # Storico segnali + Alert
 # --------------------------------------------------------------------------
 def record_signal_if_changed(conn, ticker, result):
-    """Se il segnale è cambiato rispetto all'ultimo registrato, lo salva e invia mail."""
+    """Registra il segnale tecnico nello storico se è cambiato — resta solo
+    un log, non genera più un alert autonomo (vedi nota sopra
+    notify_signal_change): l'unico alert per un ticker è quello del
+    Decision Engine, così Telegram non può mai dire una cosa diversa da
+    quella mostrata nell'app."""
     last = conn.execute(
         "SELECT signal FROM signals WHERE ticker = ? ORDER BY timestamp DESC LIMIT 1",
         (ticker,),
@@ -1850,8 +1846,6 @@ def record_signal_if_changed(conn, ticker, result):
             ),
         )
         conn.commit()
-        if old_signal is not None:
-            notify_signal_change(ticker, old_signal, result)
 
 
 def check_alerts(conn, ticker, price):
@@ -2309,6 +2303,7 @@ def classify_news_item(title, publisher=None):
     return {
         "event_type": best["event_type"],
         "severity": best["severity"],
+        "direction": config.NEWS_RULES[best["event_type"]]["direction"],
         "confidence": confidence,
         "matched_rules": sorted({m["event_type"] for m in confirmed}),
     }
@@ -2321,39 +2316,65 @@ def _news_severity_label(severity):
     return "informational"
 
 
+def _normalize_headline(title):
+    """Chiave di deduplica: stessa notizia ripresa da fonti diverse (o
+    indicizzata due volte da Yahoo) non deve contare come due eventi."""
+    return re.sub(r"[^a-z0-9 ]", "", (title or "").lower()).strip()
+
+
 def assess_news(ticker):
     """Funzione canonica del News Engine: recupera le notizie recenti,
-    classifica ogni titolo con classify_news_item, e ritorna l'evento di
-    severità più alta trovato (event_type, severity, confidence, source,
-    published_at, matched_rules, headline, url) — o severity 0 se nessun
-    evento rilevante, MAI un input mancante silenzioso. Logga ogni evento
-    nuovo (per url) in news_events per lo storico News/Eventi."""
+    classifica ogni titolo con classify_news_item, deduplica per titolo
+    normalizzato, e ritorna sia l'evento di severità più alta (usato dal
+    Decision Engine per lo scoring) sia la lista completa degli eventi
+    classificati (usata dal pannello News Intelligence) — o severity 0/
+    lista vuota se nessun evento rilevante, MAI un dato mancante silenzioso.
+    Logga ogni evento nuovo (per url) in news_events per lo storico."""
     items = _fetch_recent_news(ticker)
-    best = None
+    seen_headlines = set()
+    events = []
     for n in items:
         title = n.get("title") or ""
+        key = _normalize_headline(title)
+        if not key or key in seen_headlines:
+            continue
         publisher = n.get("publisher")
         classified = classify_news_item(title, publisher)
         if not classified:
             continue
-        event = {
+        seen_headlines.add(key)
+        reliable = publisher in config.NEWS_RELIABLE_PUBLISHERS
+        verification = (
+            "VERIFIED" if reliable and classified["confidence"] >= 0.7
+            else "UNVERIFIED" if classified["confidence"] < 0.6
+            else "SECONDARY"
+        )
+        events.append({
             **classified,
             "source": publisher,
             "published_at": n.get("providerPublishTime"),
             "headline": title,
             "url": n.get("link"),
-        }
-        if best is None or event["severity"] > best["severity"]:
-            best = event
+            "severity_label": _news_severity_label(classified["severity"]),
+            "verification_status": verification,
+        })
+
+    events.sort(key=lambda e: (e["severity"], e["published_at"] or 0), reverse=True)
+
+    # "best" — usato per lo scoring del rischio e per il trigger SELL della
+    # regola 3 dello Settimanale — considera SOLO eventi negativi: un major
+    # contract o una guidance raise non devono mai alzare il punteggio di
+    # rischio né essere scambiati per un "evento di rottura tesi".
+    negative_events = [e for e in events if e["direction"] == "negative"]
+    best = negative_events[0] if negative_events else None
 
     if best is None:
         return {
-            "event_type": None, "severity": 0, "confidence": 1.0, "source": None,
-            "published_at": None, "matched_rules": [], "headline": None, "url": None,
-            "severity_label": "informational",
+            "event_type": None, "severity": 0, "direction": None, "confidence": 1.0,
+            "source": None, "published_at": None, "matched_rules": [], "headline": None,
+            "url": None, "severity_label": "informational", "events": events[:10],
         }
 
-    best["severity_label"] = _news_severity_label(best["severity"])
     if best.get("url"):
         conn = get_db()
         try:
@@ -2367,7 +2388,7 @@ def assess_news(ticker):
             conn.commit()
         finally:
             conn.close()
-    return best
+    return {**best, "events": events[:10]}
 
 
 def _check_recent_event_ai(ticker, news):
@@ -2555,6 +2576,7 @@ def evaluate_decision(ticker):
     layers = {"technical": technical_layer, "fundamental": fundamental_layer,
               "bottleneck": bottleneck_layer, "news": news_layer}
     result = _finalize_decision(ticker, price, layers, data_sources)
+    result["news_events"] = news.get("events", [])
 
     # Sezione 28: lo Screener Settimanale (7 regole, indipendente) resta il
     # secondo parere. Se il ticker è nella sua lista, mostralo sempre a
@@ -3489,6 +3511,32 @@ def api_decisions_log():
     return jsonify(out)
 
 
+@app.route("/api/decisions/history", methods=["GET"])
+def api_decisions_history():
+    """Storico dei cambi di decisione del Decision Engine (tab Storico) — a
+    differenza di /api/decisions (solo l'ultima per ticker), qui ogni riga è
+    un cambio di decisione realmente avvenuto (changed=1), la stessa fonte
+    usata per gli alert Telegram/mail: cosa mostra Storico è sempre coerente
+    con cosa ha inviato il bot, perché entrambi leggono da qui."""
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM decisions WHERE changed = 1 ORDER BY ts DESC LIMIT 200"
+        ).fetchall()
+    finally:
+        conn.close()
+    out = []
+    for row in rows:
+        out.append({
+            "ticker": row["ticker"], "ts": row["ts"], "price": row["price"],
+            "decision": row["decision"], "previous_decision": row["previous_decision"],
+            "final_score": row["final_score"],
+            "reason_codes": json.loads(row["reason_codes"]) if row["reason_codes"] else [],
+            "filter_version": row["filter_version"],
+        })
+    return jsonify(out)
+
+
 @app.route("/api/accuracy/decisions", methods=["GET"])
 def api_decision_accuracy():
     return jsonify(compute_decision_accuracy())
@@ -4303,7 +4351,6 @@ nav.bottom button.active { color: var(--blue); }
       </div>
     </div>
     <div id="scan-result"></div>
-    <div id="scan-decision"></div>
   </div>
 
   <!-- PORTAFOGLIO -->
@@ -4363,6 +4410,12 @@ nav.bottom button.active { color: var(--blue); }
 
   <!-- STORICO -->
   <div class="tab-view" id="tab-history">
+    <div class="dim" style="font-size:12px;margin-bottom:8px">🧭 Storico delle decisioni del Decision Engine — la stessa fonte usata per gli alert Telegram/mail. È l'unica decisione autorevole dell'app.</div>
+    <div id="decisions-history-list"></div>
+    <div class="card" style="margin-top:16px">
+      <b style="font-size:14px">📊 Segnale tecnico (solo un livello del Decision Engine)</b>
+      <div class="dim" style="font-size:12px;margin-top:4px">Log del solo indicatore tecnico, mostrato per trasparenza — NON è la decisione finale (vedi sopra).</div>
+    </div>
     <div class="card" id="history-stats"></div>
     <div id="history-list"></div>
   </div>
@@ -4820,7 +4873,7 @@ function renderAnalysisCard(a, extraButtons) {
     <div class="metrics">
       <div class="metric"><div class="val">${a.rsi}</div><div class="lbl">RSI 14</div></div>
       <div class="metric"><div class="val">${a.ma50}</div><div class="lbl">MA50</div></div>
-      <div class="metric"><div class="val">${a.score}</div><div class="lbl">Score</div></div>
+      <div class="metric"><div class="val">${a.score}</div><div class="lbl">Score tecnico</div></div>
       <div class="metric"><div class="val">${a.dist_high52}%</div><div class="lbl">da Max 52W</div></div>
       <div class="metric"><div class="val">${a.dist_low52}%</div><div class="lbl">da Min 52W</div></div>
       <div class="metric"><div class="val">${a.vol_ratio != null ? a.vol_ratio + 'x' : '—'}</div><div class="lbl">Volume/media</div></div>
@@ -4838,7 +4891,10 @@ function renderAnalysisCard(a, extraButtons) {
           <div class="ticker-name">${a.ticker} <span class="dim">${a.name || ''}</span></div>
           <div class="dim">${a.price} ${a.currency} (${a.day_chg >= 0 ? '+' : ''}${a.day_chg}%)</div>
         </div>
-        <span class="pill ${a.signal}">${a.signal}</span>
+        <div style="text-align:right">
+          <div class="dim" style="font-size:11px">Segnale tecnico</div>
+          <span class="pill ${a.signal}">${a.signal}</span>
+        </div>
       </div>
       ${metrics}
       ${reasons}
@@ -4847,61 +4903,128 @@ function renderAnalysisCard(a, extraButtons) {
     </div>`;
 }
 
+// --------------------------------------------------------------------------
+// Scanner: card unificata. Il Decision Engine è l'UNICA fonte della
+// decisione finale mostrata — il segnale tecnico resta visibile ma solo
+// come uno dei 4 livelli che lo alimentano, mai come una seconda
+// "decisione" indipendente (era esattamente il bug: card tecnica BUY,
+// Decision Engine HOLD, due voci diverse per lo stesso ticker).
+// --------------------------------------------------------------------------
+const DECISION_LABELS = {
+  BUY: 'BUY', SELL: 'SELL', HOLD: 'HOLD',
+  BUY_BLOCKED: 'BUY BLOCCATO', DATA_UNAVAILABLE: 'DATI NON DISPONIBILI',
+};
+
+function timeAgo(iso) {
+  if (!iso) return null;
+  const diffMin = Math.round((Date.now() - new Date(iso).getTime()) / 60000);
+  if (diffMin < 1) return 'adesso';
+  if (diffMin < 60) return `${diffMin} min fa`;
+  const h = Math.floor(diffMin / 60), m = diffMin % 60;
+  return `${h}h${m ? ' ' + m + 'min' : ''} fa`;
+}
+
+function layerCoverageRow(label, score) {
+  return score != null
+    ? `<div class="row" style="font-size:13px;padding:5px 0;border-bottom:1px solid var(--border)"><span>✓ ${label}</span><span class="dim">${Math.round(score)}/100</span></div>`
+    : `<div class="row" style="font-size:13px;padding:5px 0;border-bottom:1px solid var(--border)"><span style="color:var(--sell)">⚠ ${label}</span><span class="dim">NON DISPONIBILE</span></div>`;
+}
+
+function newsEventRow(e) {
+  const dot = e.direction === 'negative' ? '🔴' : e.direction === 'positive' ? '🟢' : '⚪';
+  const age = timeAgo(e.published_at ? new Date(e.published_at * 1000).toISOString() : null) || '';
+  const verifBadge = { VERIFIED: '✓ Verificata', SECONDARY: 'Secondaria', UNVERIFIED: '⚠ Non verificata' }[e.verification_status] || '';
+  const link = e.url ? `<a href="${e.url}" target="_blank" rel="noopener" style="color:var(--text);text-decoration:underline">${e.headline}</a>` : e.headline;
+  return `
+    <div style="padding:8px 0;border-bottom:1px solid var(--border)">
+      <div style="font-size:13px">${dot} <b>${e.source || 'fonte sconosciuta'}</b> · ${age}</div>
+      <div style="font-size:13px;margin-top:2px">${link}</div>
+      <div class="dim" style="font-size:11px;margin-top:2px">${e.severity_label.toUpperCase()} — ${verifBadge}</div>
+    </div>`;
+}
+
+function renderScannerResult(a, d) {
+  if (a.error) {
+    return `<div class="card"><div class="row"><b>${a.ticker}</b><span class="dim">${a.error}</span></div></div>`;
+  }
+  const decision = (d && !d.error) ? d.decision : 'DATA_UNAVAILABLE';
+  const label = DECISION_LABELS[decision] || decision;
+  const freshness = timeAgo(a.updated);
+  const isStale = a.updated && (Date.now() - new Date(a.updated).getTime()) / 60000 > 60;
+
+  const coverage = d && d.coverage_pct != null ? d.coverage_pct : null;
+  const coverageBadge = coverage != null
+    ? `<span style="color:${coverage >= 65 ? 'var(--buy)' : 'var(--sell)'};font-weight:700">${coverage}% ${coverage >= 65 ? '✓' : '⚠'}</span>`
+    : '<span class="dim">n/d</span>';
+
+  const layers = (d && d.layers) || {};
+  const layerRows = layerCoverageRow('Technical', layers.technical)
+    + layerCoverageRow('Fundamental', layers.fundamental)
+    + layerCoverageRow('Bottleneck', layers.bottleneck)
+    + layerCoverageRow('News', layers.news);
+
+  const newsEvents = (d && d.news_events) || [];
+  const newsPanel = `
+    <div class="card">
+      <b style="font-size:14px">📰 News Intelligence</b>
+      ${newsEvents.length
+        ? newsEvents.slice(0, 8).map(newsEventRow).join('')
+        : '<div class="dim" style="font-size:13px;margin-top:8px">Nessun evento rilevante trovato nelle notizie recenti.</div>'}
+    </div>`;
+
+  const ws = d && d.weekly_screener;
+  const wsPanel = ws ? `
+    <div class="card">
+      <b style="font-size:14px">📅 Weekly Screener</b>
+      <div class="row" style="margin-top:8px"><span class="dim">Stato</span><b>${ws.category.toUpperCase()}</b></div>
+      ${ws.fcf_negative ? '<div class="row" style="margin-top:4px"><span class="dim">FCF</span><span style="color:var(--sell)">⚠ NEGATIVO</span></div>' : ''}
+      ${ws.note ? `<div class="dim" style="font-size:12px;margin-top:8px">Reason: ${ws.note}</div>` : ''}
+      ${ws.conflict ? '<div style="margin-top:8px;padding:8px;border-radius:8px;background:rgba(239,68,68,0.12);border:1px solid rgba(239,68,68,0.3);font-size:12px">⚠️ In conflitto con il Decision Engine — vince la prudenza.</div>' : ''}
+    </div>` : '';
+
+  const codes = (d && d.reason_codes || []).map(c => `<div>• ${c}</div>`).join('') || '<div class="dim">Nessun codice motivazione</div>';
+
+  return `
+    <div class="card stripe ${decision === 'BUY' ? 'BUY' : decision === 'SELL' ? 'SELL' : 'HOLD'}">
+      <div class="row">
+        <div>
+          <div class="ticker-name">${a.ticker} <span class="dim">${a.name || ''}</span></div>
+          <div class="dim">${a.price} ${a.currency} (${a.day_chg >= 0 ? '+' : ''}${a.day_chg}%)</div>
+        </div>
+      </div>
+      <div style="margin-top:12px;text-align:center;padding:14px;border-radius:10px;background:var(--card2)">
+        <div class="dim" style="font-size:12px;letter-spacing:0.5px">FINAL DECISION</div>
+        <div style="font-size:26px;font-weight:800;color:${decisionColor(decision)};margin-top:4px">${label}</div>
+      </div>
+      <div class="row" style="margin-top:10px;font-size:12px">
+        <span class="dim">Dati aggiornati: ${freshness || '—'}</span>
+        ${isStale ? '<span style="color:var(--sell)">⚠ DATI NON RECENTI</span>' : ''}
+      </div>
+      <div class="row" style="margin-top:12px">
+        <span style="font-size:13px;font-weight:600">Data Coverage</span>
+        ${coverageBadge}
+      </div>
+      <div style="margin-top:6px">${layerRows}</div>
+      <div class="reasons" style="margin-top:10px"><b style="font-size:13px">PERCHÉ</b>${codes}</div>
+      <button style="margin-top:12px;width:100%" onclick="quickAdd('${a.ticker}', ${a.price})">＋ Aggiungi al portafoglio</button>
+    </div>
+    ${newsPanel}
+    ${wsPanel}`;
+}
+
 async function scanTicker() {
   const ticker = document.getElementById('scan-input').value.trim().toUpperCase();
   if (!ticker) return;
-  document.getElementById('scan-result').innerHTML = '<div class="spinner">Analisi in corso…</div>';
-  document.getElementById('scan-decision').innerHTML = '';
-  const res = await fetch(`/api/scan/${ticker}`);
-  const a = await res.json();
-  const btn = a.error ? '' : `<button style="margin-top:10px" onclick="quickAdd('${a.ticker}', ${a.price})">+ Aggiungi al portafoglio</button>`;
-  document.getElementById('scan-result').innerHTML = renderAnalysisCard(a, btn);
-  if (!a.error) loadDecision(ticker);
+  document.getElementById('scan-result').innerHTML = '<div class="spinner">Analisi in corso… (prezzo → tecnico → fondamentali → bottleneck → news → verifica → decisione)</div>';
+  const [scanRes, decisionRes] = await Promise.all([
+    fetch(`/api/scan/${ticker}`).then(r => r.json()).catch(() => ({ ticker, error: 'Errore di rete' })),
+    fetch(`/api/decisions/${ticker}`).then(r => r.json()).catch(() => null),
+  ]);
+  document.getElementById('scan-result').innerHTML = renderScannerResult(scanRes, decisionRes);
 }
 
 function decisionColor(d) {
   return { BUY: 'var(--buy)', SELL: 'var(--sell)', HOLD: '#eab308', BUY_BLOCKED: 'var(--sell)', DATA_UNAVAILABLE: 'var(--dim)' }[d] || 'var(--dim)';
-}
-
-async function loadDecision(ticker) {
-  const el = document.getElementById('scan-decision');
-  el.innerHTML = '<div class="spinner">Decision Engine…</div>';
-  try {
-    const res = await fetch(`/api/decisions/${ticker}`);
-    const d = await res.json();
-    const scoreLine = d.final_score != null ? `<div class="metric"><div class="val">${d.final_score}/100</div><div class="lbl">Final score</div></div>` : '';
-    const coverageLine = d.coverage_pct != null ? `<div class="metric"><div class="val" style="color:${d.coverage_pct >= 65 ? 'var(--buy)' : 'var(--sell)'}">${d.coverage_pct}%${d.coverage_pct >= 65 ? ' ✓' : ' ⚠'}</div><div class="lbl">Data coverage</div></div>` : '';
-    const layers = d.layers ? Object.entries(d.layers).map(([k, v]) => `
-      <div class="metric"><div class="val">${v != null ? Math.round(v) : '—'}</div><div class="lbl">${k}${v == null ? ' ⚠' : ''}</div></div>
-    `).join('') : '';
-    const codes = (d.reason_codes || []).map(c => `<div>• ${c}</div>`).join('') || '<div class="dim">Nessun codice motivazione</div>';
-    const lowCoverage = (d.reason_codes || []).some(c => c.startsWith('DATA-COVERAGE-LOW'));
-    const blocked = d.decision === 'BUY_BLOCKED';
-    const coverageNote = lowCoverage
-      ? `<div style="margin-top:8px;padding:8px;border-radius:8px;background:rgba(234,179,8,0.12);border:1px solid rgba(234,179,8,0.3);font-size:12px">⚠️ DATI INSUFFICIENTI — SEGNALE BLOCCATO. Troppi dati mancanti per fidarsi di un BUY/SELL: la decisione resta HOLD per prudenza, qualunque fosse il punteggio calcolato solo sui livelli disponibili.</div>`
-      : blocked
-      ? `<div style="margin-top:8px;padding:8px;border-radius:8px;background:rgba(239,68,68,0.12);border:1px solid rgba(239,68,68,0.3);font-size:12px">🚫 BUY BLOCCATO: il punteggio suggerirebbe un acquisto, ma manca un dato critico (es. free cash flow) necessario a verificarlo davvero.</div>`
-      : '';
-    const ws = d.weekly_screener;
-    const wsNote = ws
-      ? `<div style="margin-top:8px;padding:8px;border-radius:8px;${ws.conflict ? 'background:rgba(239,68,68,0.12);border:1px solid rgba(239,68,68,0.3)' : 'background:var(--card2);border:1px solid var(--border)'};font-size:12px">
-          ${ws.conflict ? '⚠️ In conflitto con ' : ''}📅 Screener Settimanale: <b>${ws.category}</b>${ws.fcf_negative ? ' — FCF negativo' : ''}${ws.note ? ' — ' + ws.note : ''}
-        </div>`
-      : '';
-    const transition = d.previous_decision ? `${d.previous_decision} → ${d.decision}` : d.decision;
-    el.innerHTML = `
-      <div class="card">
-        <div class="row"><b style="font-size:14px">🧭 Decision Engine — PERCHÉ</b>
-          <span style="color:${decisionColor(d.decision)};font-weight:700">${transition}</span></div>
-        <div class="metrics" style="margin-top:8px">${scoreLine}${coverageLine}${layers}</div>
-        <div class="reasons" style="margin-top:8px">${codes}</div>
-        ${coverageNote}
-        ${wsNote}
-        <div class="dim" style="font-size:11px;margin-top:8px">Filter version: ${d.filter_version} — nessuna AI, formula fissa e versionata.</div>
-      </div>`;
-  } catch (e) {
-    el.innerHTML = '';
-  }
 }
 
 function quickAdd(ticker, price) {
@@ -5013,7 +5136,40 @@ async function removeAlert(id) {
   loadAlerts();
 }
 
+async function loadDecisionsHistory() {
+  const el = document.getElementById('decisions-history-list');
+  el.innerHTML = '<div class="spinner">Caricamento…</div>';
+  try {
+    const res = await fetch('/api/decisions/history');
+    const rows = await res.json();
+    if (!rows.length) {
+      el.innerHTML = '<div class="card"><div class="dim">Nessun cambio di decisione ancora registrato.</div></div>';
+      return;
+    }
+    el.innerHTML = rows.map(d => {
+      const transition = d.previous_decision ? `${d.previous_decision} → ${d.decision}` : d.decision;
+      const codes = (d.reason_codes || []).map(c => `<div>• ${c}</div>`).join('');
+      return `
+      <div class="card stripe ${d.decision === 'BUY' ? 'BUY' : d.decision === 'SELL' ? 'SELL' : 'HOLD'}">
+        <div class="row">
+          <div>
+            <b>${d.ticker}</b>
+            <span style="color:${decisionColor(d.decision)};font-weight:700;margin-left:6px">${transition}</span>
+            <div class="dim">${d.price != null ? d.price : ''} ${d.final_score != null ? '· score ' + d.final_score : ''}</div>
+          </div>
+          <span class="dim">${(d.ts || '').replace('T', ' ').slice(0, 16)}</span>
+        </div>
+        ${codes ? `<div class="reasons">${codes}</div>` : ''}
+        <div class="dim" style="font-size:11px;margin-top:6px">Engine v${d.filter_version}</div>
+      </div>`;
+    }).join('');
+  } catch (e) {
+    el.innerHTML = '<div class="card"><div class="dim">Errore nel caricamento dello storico decisioni.</div></div>';
+  }
+}
+
 async function loadHistory() {
+  loadDecisionsHistory();
   document.getElementById('history-list').innerHTML = '<div class="spinner">Caricamento…</div>';
   const res = await fetch('/api/history');
   const data = await res.json();

@@ -284,43 +284,74 @@ BOTTLENECK_CACHE_TTL_SECONDS = 24 * 3600
 # confermato. NEWS_SEVERITY_LABELS mappa la severità numerica a un'etichetta
 # (informational/watch/warning/serious/critical). Modifica pure queste
 # liste — sono l'unico posto dove aggiornare cosa conta come "evento reale".
+# Motore notizie deterministico (zero AI). Ogni regola ha una severità fissa
+# 0-10, una "direction" (negative/positive/neutral — determina se l'evento
+# alza il rischio o lo abbassa nel Decision Engine, mai il contrario) e un
+# elenco di frasi chiave (case-insensitive, italiano+inglese). Se una frase
+# compare in un titolo di notizia e non è negata nelle 4 parole precedenti
+# ("denies fraud", "rules out bankruptcy"), l'evento è confermato.
+# NEWS_SEVERITY_LABELS mappa la severità numerica a un'etichetta
+# (informational/watch/warning/serious/critical). Modifica pure queste
+# liste — sono l'unico posto dove aggiornare cosa conta come "evento reale".
 NEWS_RULES = {
-    "guidance_cut": {"severity": 7, "keywords": [
+    # --- Negativi: alzano il rischio, possono attivare SELL/HOLD/blocchi ---
+    "guidance_cut": {"severity": 7, "direction": "negative", "keywords": [
         "guidance cut", "cuts guidance", "guidance tagliata", "lowers guidance",
         "slashes forecast", "cuts forecast", "lowers forecast",
     ]},
-    "earnings_miss": {"severity": 6, "keywords": [
+    "earnings_miss": {"severity": 6, "direction": "negative", "keywords": [
         "misses estimates", "missed estimates", "earnings miss", "profit warning",
     ]},
-    "ceo_departure": {"severity": 6, "keywords": [
+    "ceo_departure": {"severity": 6, "direction": "negative", "keywords": [
         "ceo resigns", "ceo resignation", "ceo steps down", "dimissioni del ceo", "ceo departure",
     ]},
-    "cfo_departure": {"severity": 4, "keywords": [
+    "cfo_departure": {"severity": 4, "direction": "negative", "keywords": [
         "cfo resigns", "cfo resignation", "cfo steps down",
     ]},
-    "legal_issue": {"severity": 6, "keywords": [
+    "legal_issue": {"severity": 6, "direction": "negative", "keywords": [
         "lawsuit", "causa legale", "class action", "sued", "denuncia",
     ]},
-    "regulatory_investigation": {"severity": 7, "keywords": [
+    "regulatory_investigation": {"severity": 7, "direction": "negative", "keywords": [
         "investigation", "indagine", "probe launched", "under scrutiny",
     ]},
-    "sec_action": {"severity": 9, "keywords": [
+    "sec_action": {"severity": 9, "direction": "negative", "keywords": [
         "sec charges", "sec action", "sec inquiry", "sec probe", "sec investigation",
     ]},
-    "recall": {"severity": 5, "keywords": ["recall", "richiamo"]},
-    "fraud": {"severity": 10, "keywords": ["fraud", "frode"]},
-    "bankruptcy": {"severity": 10, "keywords": [
+    "recall": {"severity": 5, "direction": "negative", "keywords": ["recall", "richiamo"]},
+    "fraud": {"severity": 10, "direction": "negative", "keywords": ["fraud", "frode"]},
+    "bankruptcy": {"severity": 10, "direction": "negative", "keywords": [
         "bankruptcy", "fallimento", "files for chapter 11", "chapter 11",
     ]},
-    "data_breach": {"severity": 6, "keywords": ["data breach", "cyberattack", "hacked"]},
-    "delisting": {"severity": 8, "keywords": ["delisting", "delisted"]},
-    "downgrade": {"severity": 4, "keywords": ["downgrade", "downgraded", "declassato", "declassata"]},
-    "dividend_cut": {"severity": 6, "keywords": [
+    "data_breach": {"severity": 6, "direction": "negative", "keywords": ["data breach", "cyberattack", "hacked"]},
+    "delisting": {"severity": 8, "direction": "negative", "keywords": ["delisting", "delisted"]},
+    "downgrade": {"severity": 4, "direction": "negative", "keywords": ["downgrade", "downgraded", "declassato", "declassata"]},
+    "dividend_cut": {"severity": 6, "direction": "negative", "keywords": [
         "dividend cut", "cuts dividend", "suspends dividend", "taglia il dividendo",
     ]},
-    "acquisition": {"severity": 2, "keywords": ["to acquire", "acquisition", "acquisisce"]},
-    "buyback": {"severity": 1, "keywords": ["buyback", "share repurchase"]},
+
+    # --- Positivi: non contano come rischio, mostrati comunque nel pannello news ---
+    "guidance_raise": {"severity": 7, "direction": "positive", "keywords": [
+        "raises guidance", "guidance raise", "boosts forecast", "raises forecast", "alza le stime",
+    ]},
+    "earnings_beat": {"severity": 6, "direction": "positive", "keywords": [
+        "beats estimates", "earnings beat", "tops estimates", "beats expectations",
+    ]},
+    "major_contract": {"severity": 7, "direction": "positive", "keywords": [
+        "wins contract", "major contract", "wins deal", "signs deal", "awarded contract",
+        "wins major", "multi-year contract", "billion-dollar contract", "billion dollar deal",
+    ]},
+    "regulatory_approval": {"severity": 6, "direction": "positive", "keywords": [
+        "fda approval", "receives approval", "wins approval", "regulatory approval",
+    ]},
+    "upgrade": {"severity": 3, "direction": "positive", "keywords": [
+        "upgrade", "upgraded", "promosso",
+    ]},
+
+    # --- Neutri: informativi, non spostano il rischio ---
+    "acquisition": {"severity": 2, "direction": "neutral", "keywords": ["to acquire", "acquisition", "acquisisce"]},
+    "buyback": {"severity": 1, "direction": "neutral", "keywords": ["buyback", "share repurchase"]},
 }
+
 
 NEWS_NEGATION_WORDS = [
     "not ", "no ", "non ", "denies", "nega", "avoids", "evita",
