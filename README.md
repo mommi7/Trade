@@ -488,11 +488,24 @@ niente altro da toccare:
 - **Limiti onesti / non ancora fatto**: nessuna integrazione con SEC
   EDGAR, nessuna gerarchia di fonti notizie a più livelli (Reuters/
   Bloomberg/WSJ richiederebbero API a pagamento, incompatibili con il
-  vincolo "zero costi" di questo progetto), nessun motore di
-  deduplicazione/conflitto tra fonti multiple, nessun tracking
-  istituzionale (13F/DataRoma). Il motore notizie resta a fonte singola
-  (Yahoo) con classificazione a parole chiave e rilevamento negazioni —
-  solido per il caso d'uso attuale, non un vero aggregatore multi-fonte.
+  vincolo "zero costi" di questo progetto), nessun tracking istituzionale
+  (13F/DataRoma). Il motore notizie resta a fonte singola (Yahoo) con
+  classificazione a parole chiave, rilevamento negazioni, direzione
+  (positiva/negativa/neutra — solo eventi negativi contano per il
+  rischio), deduplica per titolo normalizzato e verification status
+  (VERIFIED/SECONDARY/UNVERIFIED in base ad affidabilità della fonte e
+  confidenza) — solido per il caso d'uso attuale, non un vero
+  aggregatore multi-fonte con corroborazione incrociata.
+- **Storico**: la tab mostra ora il log dei cambi di decisione del
+  Decision Engine (`/api/decisions/history`, stessa fonte degli alert
+  Telegram/mail) come sezione principale; il vecchio log del solo
+  segnale tecnico resta sotto, etichettato esplicitamente come "non è
+  la decisione finale".
+- **Nav mobile**: la bottom nav a 8 tab (font 9px, illeggibile su
+  schermo piccolo) è stata ristrutturata in 4 tab dirette (Scanner,
+  Portafoglio, Bottleneck, Alert) + un foglio "Altro" per le restanti
+  (Livelli, Settimanale, Opportunità, Storico). Touch target minimi
+  garantiti a 44px su bottoni/input/nav in tutta l'app.
 - Due portafogli in un'app a singolo tenant: la tabella `tickers` ha una
   colonna `owner` (`mohamed`/`micaela`/`shared`) usata solo dal controllo
   di concentrazione dello screener a 25 titoli, non un vero multi-utente —
