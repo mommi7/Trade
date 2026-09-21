@@ -804,7 +804,7 @@ def get_fundamentals_cached(ticker):
     """Cache 24h su DB (persiste tra riavvii/redeploy) + memoria di processo
     — ma SOLO per un fetch riuscito. Un fetch completamente fallito (fund E
     market entrambi None: Yahoo/Stooq/Twelve Data tutti irraggiungibili in
-    quel momento) usa una cache molto più corta (5 minuti): prima di questo
+    quel momento) usa una cache molto più corta (20 minuti): prima di questo
     fix, un singolo 429 di passaggio veniva salvato come "nessun dato" per
     24 ore intere, e Fundamental/Bottleneck restavano bloccati su "non
     disponibile" per tutto il giorno anche se Yahoo tornava disponibile

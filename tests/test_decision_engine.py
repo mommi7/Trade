@@ -309,7 +309,7 @@ class DecisionEngineRegressionTests(unittest.TestCase):
     # salvato in cache per 24 ORE come "nessun dato", bloccando
     # Fundamental/Bottleneck su "non disponibile" tutto il giorno anche
     # se Yahoo tornava disponibile pochi minuti dopo. Un fallimento deve
-    # usare una cache molto più corta (5 minuti) di un successo (24h).
+    # usare una cache molto più corta (20 minuti) di un successo (24h).
     # ------------------------------------------------------------------
     def test_13_failed_fundamentals_fetch_is_not_cached_for_24h(self):
         with patch("app.fetch_yahoo_fundamentals", return_value=None), \
@@ -318,14 +318,14 @@ class DecisionEngineRegressionTests(unittest.TestCase):
             first = app.get_fundamentals_cached("FAILCO")
         self.assertIsNone(first["fundamentals"])
 
-        # 6 minuti dopo (oltre la cache-fallimento di 5 minuti, ben dentro
+        # 21 minuti dopo (oltre la cache-fallimento di 20 minuti, ben dentro
         # le 24h di una cache normale): deve ritentare, non servire la
         # cache vecchia.
         app._BOTTLENECK_MEM_CACHE.pop("FAILCO", None)
         conn = app.get_db()
         try:
             conn.execute("UPDATE bottleneck_cache SET fetched_at = ? WHERE ticker = 'FAILCO'",
-                         (time.time() - 360,))
+                         (time.time() - 21 * 60,))
             conn.commit()
         finally:
             conn.close()

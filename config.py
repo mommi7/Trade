@@ -276,9 +276,13 @@ DEFENSIVE_SECTORS = {"Difensivo", "Healthcare", "Salute", "Beni di consumo prima
 # scansione dell'intero universo. Un fetch completamente fallito (nessuna
 # fonte ha risposto) usa una cache molto più corta: non deve bloccare
 # Fundamental/Bottleneck su "non disponibile" per un giorno intero per un
-# blocco temporaneo di qualche minuto.
+# blocco temporaneo di qualche minuto. 20 minuti è un compromesso: abbastanza
+# breve da riprendersi da soli entro la stessa giornata, abbastanza lungo da
+# non ritentare Twelve Data (piano gratuito: 800 richieste/giorno) a ogni
+# singolo tick su un titolo che sta fallendo per un blocco più lungo (es.
+# quota Twelve Data esaurita per il resto della giornata).
 BOTTLENECK_CACHE_TTL_SECONDS = 24 * 3600
-BOTTLENECK_CACHE_FAILURE_TTL_SECONDS = 5 * 60
+BOTTLENECK_CACHE_FAILURE_TTL_SECONDS = 20 * 60
 
 # --------------------------------------------------------------------------
 # Motore notizie deterministico (zero AI). Ogni regola ha una severità fissa
