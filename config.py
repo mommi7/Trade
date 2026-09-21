@@ -39,6 +39,12 @@ TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY", "")
 # prima si evita di sprecare le ultime chiamate utili in retry falliti.
 TWELVEDATA_DAILY_BUDGET = 750
 
+# Circuit breaker: un 429 reale ricevuto da Twelve Data blocca nuove
+# richieste per questo tempo, indipendentemente dal conteggio locale del
+# budget — che può sbagliarsi (es. dopo un redeploy il conteggio riparte
+# da zero, ma la quota reale lato Twelve Data può essere ancora esaurita).
+TWELVEDATA_CIRCUIT_COOLDOWN_SECONDS = 30 * 60
+
 # Commento AI opzionale sopra ogni segnale (facoltativo). Usa la API
 # gratuita di Google Gemini (https://aistudio.google.com/apikey — free
 # tier senza carta di credito). Lasciala vuota per non usarla: l'app

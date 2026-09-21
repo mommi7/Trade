@@ -423,6 +423,38 @@ class DecisionEngineRegressionTests(unittest.TestCase):
         finally:
             config.TWELVEDATA_API_KEY = orig_key
 
+    # ------------------------------------------------------------------
+    # TEST 17 — circuit breaker: un 429 REALE ricevuto da Twelve Data deve
+    # bloccare nuove richieste per il periodo di raffreddamento, senza
+    # nemmeno provare la rete — anche se il nostro conteggio locale del
+    # budget pensa (a torto, es. dopo un redeploy) che ci sia ancora
+    # margine. Copre il caso reale visto in produzione: un redeploy azzera
+    # il contatore locale, ma la quota lato Twelve Data resta esaurita.
+    # ------------------------------------------------------------------
+    def test_17_twelvedata_circuit_breaker_trips_on_429(self):
+        class Resp429:
+            status_code = 429
+            text = "Too Many Requests"
+
+        orig_key = config.TWELVEDATA_API_KEY
+        config.TWELVEDATA_API_KEY = "fake-key-for-test"
+        try:
+            self.assertTrue(app.twelvedata_circuit_ok())
+            with patch("app.requests.get", return_value=Resp429()):
+                errors = []
+                result = app.fetch_twelvedata("MU", errors)
+            self.assertIsNone(result)
+            self.assertFalse(app.twelvedata_circuit_ok(),
+                              "TEST 17 FALLITO: un 429 reale deve attivare il circuit breaker")
+
+            with patch("app.requests.get") as mock_get:
+                errors2 = []
+                result2 = app.fetch_twelvedata("ORCL", errors2)
+            mock_get.assert_not_called()
+            self.assertIsNone(result2)
+        finally:
+            config.TWELVEDATA_API_KEY = orig_key
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

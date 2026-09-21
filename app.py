@@ -211,6 +211,11 @@ def init_db():
             calls INTEGER DEFAULT 0,
             PRIMARY KEY (provider, day)
         );
+
+        CREATE TABLE IF NOT EXISTS provider_circuit (
+            provider TEXT PRIMARY KEY,
+            blocked_until REAL
+        );
         """
     )
     conn.commit()
@@ -649,6 +654,42 @@ def twelvedata_budget_ok():
     return get_provider_usage_today("twelvedata") < config.TWELVEDATA_DAILY_BUDGET
 
 
+def _circuit_blocked_until(provider):
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT blocked_until FROM provider_circuit WHERE provider = ?", (provider,)
+        ).fetchone()
+        return row["blocked_until"] if row else None
+    finally:
+        conn.close()
+
+
+def _circuit_trip(provider, cooldown_seconds):
+    conn = get_db()
+    try:
+        until = time.time() + cooldown_seconds
+        conn.execute(
+            "INSERT INTO provider_circuit (provider, blocked_until) VALUES (?, ?) "
+            "ON CONFLICT(provider) DO UPDATE SET blocked_until = excluded.blocked_until",
+            (provider, until),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def twelvedata_circuit_ok():
+    """Circuit breaker (vedi master prompt sezione 11): un 429 REALE
+    ricevuto da Twelve Data — non solo la nostra stima di budget, che può
+    sbagliarsi se il conteggio locale riparte da zero dopo un redeploy
+    mentre la quota lato Twelve Data è ancora esaurita — blocca nuove
+    richieste per un periodo di raffreddamento, invece di continuare a
+    sbattere contro lo stesso muro un ticker alla volta."""
+    until = _circuit_blocked_until("twelvedata")
+    return not until or time.time() >= until
+
+
 def fetch_twelvedata(ticker, errors=None):
     """Terzo fallback, con API key gratuita (twelvedata.com). Usato solo se
     TWELVEDATA_API_KEY è impostata: utile quando l'hosting cloud ha l'IP
@@ -660,6 +701,10 @@ def fetch_twelvedata(ticker, errors=None):
     if not twelvedata_budget_ok():
         if errors is not None:
             errors.append("Twelve Data: budget giornaliero esaurito, salto la richiesta")
+        return None
+    if not twelvedata_circuit_ok():
+        if errors is not None:
+            errors.append("Twelve Data: 429 recente, in pausa (circuit breaker)")
         return None
     symbol = ticker.replace("-", "/") if is_crypto_ticker(ticker) else ticker
     try:
@@ -673,6 +718,13 @@ def fetch_twelvedata(ticker, errors=None):
             "apikey": config.TWELVEDATA_API_KEY,
         }
         r = requests.get(url, params=params, timeout=12)
+        if r.status_code == 429:
+            _circuit_trip("twelvedata", config.TWELVEDATA_CIRCUIT_COOLDOWN_SECONDS)
+            msg = "Twelve Data HTTP 429 — circuit breaker attivato"
+            print(f"{msg} per {ticker}")
+            if errors is not None:
+                errors.append(msg)
+            return None
         if r.status_code != 200:
             msg = f"Twelve Data HTTP {r.status_code}"
             print(f"{msg} per {ticker}: {r.text[:200]!r}")
@@ -3524,12 +3576,16 @@ def api_health_providers():
     secondo, senza dover controllare la dashboard di Twelve Data, se la
     quota giornaliera si sta avvicinando al limite."""
     td_used = get_provider_usage_today("twelvedata")
+    circuit_until = _circuit_blocked_until("twelvedata")
+    circuit_seconds_left = round(circuit_until - time.time()) if circuit_until and circuit_until > time.time() else 0
     return jsonify({
         "twelvedata": {
             "configured": bool(config.TWELVEDATA_API_KEY),
             "used_today": td_used,
             "budget": config.TWELVEDATA_DAILY_BUDGET,
             "budget_ok": twelvedata_budget_ok(),
+            "circuit_ok": twelvedata_circuit_ok(),
+            "circuit_seconds_left": circuit_seconds_left,
         },
         "gemini": {"configured": bool(config.GEMINI_API_KEY)},
         "telegram": {"configured": bool(config.TELEGRAM_BOT_TOKEN)},
