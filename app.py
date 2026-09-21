@@ -4041,6 +4041,8 @@ input, select, button {
   background: var(--card2);
   color: var(--text);
   padding: 10px;
+  min-height: 44px;
+  box-sizing: border-box;
 }
 input::placeholder { color: var(--dim); }
 button {
