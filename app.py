@@ -3088,16 +3088,7 @@ def monitor_loop():
     Su hosting cloud gratuito che va in sleep, usa /api/cron/tick invece."""
     time.sleep(10)  # Attende l'avvio di Flask
     while True:
-        for name, func in [
-            ("refresh_all_portfolio", refresh_all_portfolio),
-            ("check_watch_levels", check_watch_levels),
-            ("run_market_screener", run_market_screener),
-            ("generate_daily_verdict", generate_daily_verdict),
-            ("maybe_run_weekly_screener", maybe_run_weekly_screener),
-            ("recheck_bottleneck_decisions", recheck_bottleneck_decisions),
-            ("run_decision_engine_for_portfolio", run_decision_engine_for_portfolio),
-            ("backfill_decision_outcomes", backfill_decision_outcomes),
-        ]:
+        for name, func in _TICK_STEPS:
             _run_tick_step(name, func)
         time.sleep(3600)
 
@@ -3287,23 +3278,58 @@ def _run_tick_step(name, func):
         print(f"Errore nello step '{name}' del tick (continuo con gli altri): {e}")
 
 
+_TICK_STEPS = [
+    ("refresh_all_portfolio", refresh_all_portfolio),
+    ("check_watch_levels", check_watch_levels),
+    ("run_market_screener", run_market_screener),
+    ("generate_daily_verdict", generate_daily_verdict),
+    ("maybe_run_weekly_screener", maybe_run_weekly_screener),
+    ("recheck_bottleneck_decisions", recheck_bottleneck_decisions),
+    ("run_decision_engine_for_portfolio", run_decision_engine_for_portfolio),
+    ("backfill_decision_outcomes", backfill_decision_outcomes),
+]
+
+_TICK_STATE = {"running": False, "started_at": None, "finished_at": None}
+_TICK_LOCK = threading.Lock()
+
+
+def _run_tick_steps_background():
+    """Il lavoro vero del tick, sempre in un thread separato: con Yahoo che
+    risponde 429 su quasi tutti i titoli, ogni fase può metterci diversi
+    secondi (retry inclusi) e la somma di 8 fasi può superare il timeout
+    che Render impone a una singola richiesta HTTP — un timeout a livello
+    di infrastruttura restituisce 500 PRIMA che _run_tick_step riesca a
+    isolare l'errore, perché non è un'eccezione Python. La soluzione è non
+    far mai aspettare la richiesta HTTP: /api/cron/tick torna 200 subito,
+    il lavoro prosegue qui indipendentemente da quanto ci mette."""
+    with _TICK_LOCK:
+        if _TICK_STATE["running"]:
+            return
+        _TICK_STATE["running"] = True
+        _TICK_STATE["started_at"] = datetime.now().isoformat()
+    try:
+        for name, func in _TICK_STEPS:
+            _run_tick_step(name, func)
+    finally:
+        with _TICK_LOCK:
+            _TICK_STATE["running"] = False
+            _TICK_STATE["finished_at"] = datetime.now().isoformat()
+
+
 @app.route("/api/cron/tick", methods=["POST"])
 def api_cron_tick():
     secret = request.headers.get("X-Cron-Secret", "")
     if not config.CRON_SECRET or secret != config.CRON_SECRET:
         return jsonify({"error": "unauthorized"}), 401
-    for name, func in [
-        ("refresh_all_portfolio", refresh_all_portfolio),
-        ("check_watch_levels", check_watch_levels),
-        ("run_market_screener", run_market_screener),
-        ("generate_daily_verdict", generate_daily_verdict),
-        ("maybe_run_weekly_screener", maybe_run_weekly_screener),
-        ("recheck_bottleneck_decisions", recheck_bottleneck_decisions),
-        ("run_decision_engine_for_portfolio", run_decision_engine_for_portfolio),
-        ("backfill_decision_outcomes", backfill_decision_outcomes),
-    ]:
-        _run_tick_step(name, func)
-    return jsonify({"ok": True})
+    if _TICK_STATE["running"]:
+        return jsonify({"ok": True, "already_running": True})
+    threading.Thread(target=_run_tick_steps_background, daemon=True).start()
+    return jsonify({"ok": True, "started": True})
+
+
+@app.route("/api/cron/tick/status", methods=["GET"])
+def api_cron_tick_status():
+    return jsonify(_TICK_STATE)
 
 
 # --------------------------------------------------------------------------
