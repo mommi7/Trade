@@ -400,6 +400,29 @@ class DecisionEngineRegressionTests(unittest.TestCase):
         finally:
             config.TWELVEDATA_API_KEY = orig_key
 
+    # ------------------------------------------------------------------
+    # TEST 16 — le scansioni bulk su tutto l'universo (Opportunità,
+    # Scansiona universo: ~30 titoli non in portafoglio) non devono
+    # consumare la quota Twelve Data, riservata alle ricerche dirette
+    # dell'utente e al portafoglio. use_twelvedata=False deve impedire
+    # qualunque chiamata di rete a Twelve Data, anche se Yahoo e Stooq
+    # falliscono entrambi.
+    # ------------------------------------------------------------------
+    def test_16_bulk_scans_skip_twelvedata_even_when_needed(self):
+        orig_key = config.TWELVEDATA_API_KEY
+        config.TWELVEDATA_API_KEY = "fake-key-for-test"
+        try:
+            with patch("app.fetch_yahoo", return_value=None), \
+                 patch("app.fetch_stooq", return_value=None), \
+                 patch("app.requests.get") as mock_get, \
+                 patch("app.time.sleep", return_value=None):
+                errors = []
+                result = app.fetch_market_data("MU", errors, use_twelvedata=False)
+            self.assertIsNone(result)
+            mock_get.assert_not_called()
+        finally:
+            config.TWELVEDATA_API_KEY = orig_key
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

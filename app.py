@@ -712,24 +712,32 @@ def fetch_twelvedata(ticker, errors=None):
         return None
 
 
-def fetch_market_data(ticker, errors=None):
-    """Yahoo come fonte primaria, poi Stooq, poi Twelve Data (se configurata).
-    Se tutte e tre falliscono, un secondo giro dopo una breve pausa: il caso
-    più comune su Render free è un cold start (processo appena risvegliato
-    dallo sleep) che arriva insieme a un 429 momentaneo di Yahoo — spesso
-    sparisce da solo dopo pochi secondi, quindi vale la pena un solo retry
-    prima di arrendersi e mostrare "dati non disponibili". Se 'errors' è una
-    lista, viene riempita con il motivo esatto di ogni fallimento (fonte per
-    fonte), così l'app può mostrarlo invece del generico "dati non
-    disponibili" — niente più bisogno di controllare i log di Render a mano
-    per capire cosa è successo."""
-    data = fetch_yahoo(ticker, errors) or fetch_stooq(ticker, errors) or fetch_twelvedata(ticker, errors)
+def fetch_market_data(ticker, errors=None, use_twelvedata=True):
+    """Yahoo come fonte primaria, poi Stooq, poi Twelve Data (se configurata
+    e se use_twelvedata=True). Se tutte falliscono, un secondo giro dopo una
+    breve pausa: il caso più comune su Render free è un cold start (processo
+    appena risvegliato dallo sleep) che arriva insieme a un 429 momentaneo
+    di Yahoo — spesso sparisce da solo dopo pochi secondi, quindi vale la
+    pena un solo retry prima di arrendersi e mostrare "dati non disponibili".
+    Se 'errors' è una lista, viene riempita con il motivo esatto di ogni
+    fallimento (fonte per fonte), così l'app può mostrarlo invece del
+    generico "dati non disponibili".
+
+    use_twelvedata=False per le scansioni periodiche su decine di titoli
+    (Opportunità, Scansiona universo): quella quota va riservata alle
+    ricerche dirette dell'utente (Scanner/Bottleneck "Analizza", portafoglio)
+    — è lì che un 429 si vede subito sullo schermo, non in una scansione
+    automatica in background."""
+    def _td(t, e):
+        return fetch_twelvedata(t, e) if use_twelvedata else None
+
+    data = fetch_yahoo(ticker, errors) or fetch_stooq(ticker, errors) or _td(ticker, errors)
     if data:
         return data
     time.sleep(3)
     if errors is not None:
         errors.append("--- ritento dopo 3s ---")
-    return fetch_yahoo(ticker, errors) or fetch_stooq(ticker, errors) or fetch_twelvedata(ticker, errors)
+    return fetch_yahoo(ticker, errors) or fetch_stooq(ticker, errors) or _td(ticker, errors)
 
 
 # --------------------------------------------------------------------------
@@ -861,7 +869,7 @@ def fetch_yahoo_history(ticker, rng="3y"):
 _BOTTLENECK_MEM_CACHE = {}
 
 
-def get_fundamentals_cached(ticker):
+def get_fundamentals_cached(ticker, use_twelvedata=True):
     """Cache 24h su DB (persiste tra riavvii/redeploy) + memoria di processo
     — ma SOLO per un fetch riuscito. Un fetch completamente fallito (fund E
     market entrambi None: Yahoo/Stooq/Twelve Data tutti irraggiungibili in
@@ -869,7 +877,8 @@ def get_fundamentals_cached(ticker):
     fix, un singolo 429 di passaggio veniva salvato come "nessun dato" per
     24 ore intere, e Fundamental/Bottleneck restavano bloccati su "non
     disponibile" per tutto il giorno anche se Yahoo tornava disponibile
-    pochi minuti dopo."""
+    pochi minuti dopo. use_twelvedata=False per le scansioni bulk (vedi
+    fetch_market_data)."""
     now = time.time()
     mem = _BOTTLENECK_MEM_CACHE.get(ticker)
     if mem and now - mem["at"] < mem["ttl"]:
@@ -892,7 +901,7 @@ def get_fundamentals_cached(ticker):
                 return fund
 
         fund = fetch_yahoo_fundamentals(ticker)
-        market = fetch_market_data(ticker)
+        market = fetch_market_data(ticker, use_twelvedata=use_twelvedata)
         history_3y = fetch_yahoo_history(ticker, "3y")
         high_52w = None
         return_3y_pct = None
@@ -1165,12 +1174,13 @@ def compute_portfolio_constraints(ticker, sector, thresholds, owner=None):
     return {"checks": checks, "blocked": bool(blocked_by), "blocked_by": blocked_by}
 
 
-def analyze_bottleneck(ticker, thresholds=None, owner=None):
+def analyze_bottleneck(ticker, thresholds=None, owner=None, use_twelvedata=True):
     """Esegue entrambi i motori + il livello di portafoglio per un ticker,
     con le soglie correnti (default se non passate). Ritorna la struttura
-    completa mostrata dalla card UI."""
+    completa mostrata dalla card UI. use_twelvedata=False per le scansioni
+    bulk su tutto l'universo (vedi fetch_market_data)."""
     th = thresholds or config.BOTTLENECK_DEFAULTS
-    combined = get_fundamentals_cached(ticker)
+    combined = get_fundamentals_cached(ticker, use_twelvedata=use_twelvedata)
     if not combined or not (combined.get("market") or {}).get("price"):
         return {"ticker": ticker, "error": "Dati non disponibili per questo ticker"}
 
@@ -1782,11 +1792,14 @@ def compute_signal(closes, price, custom_buy=None, custom_sell=None, volumes=Non
     }
 
 
-def analyze_ticker(ticker, custom_buy=None, custom_sell=None):
-    """Recupera i dati e calcola il segnale per un ticker. Non solleva mai eccezioni."""
+def analyze_ticker(ticker, custom_buy=None, custom_sell=None, use_twelvedata=True):
+    """Recupera i dati e calcola il segnale per un ticker. Non solleva mai
+    eccezioni. use_twelvedata=False per le scansioni bulk su tutto
+    l'universo (vedi fetch_market_data): quella quota va riservata alle
+    ricerche dirette dell'utente e al portafoglio."""
     try:
         errors = []
-        data = fetch_market_data(ticker, errors)
+        data = fetch_market_data(ticker, errors, use_twelvedata=use_twelvedata)
         if not data or len(data["closes"]) < 2:
             detail = " — " + "; ".join(errors[-4:]) if errors else ""
             return {"ticker": ticker, "error": f"Impossibile recuperare dati per {ticker}{detail}"}
@@ -2279,7 +2292,7 @@ def run_market_screener(send_email=True):
         if ticker in active_tickers:
             continue
         try:
-            result = analyze_ticker(ticker)
+            result = analyze_ticker(ticker, use_twelvedata=False)
         except Exception as e:
             print(f"Errore screener per {ticker}: {e}")
             continue
@@ -3556,7 +3569,7 @@ def _run_bottleneck_scan(thresholds):
                                         "started_at": datetime.now().isoformat(), "finished_at": None})
     for ticker in universe:
         try:
-            result = analyze_bottleneck(ticker, thresholds=thresholds)
+            result = analyze_bottleneck(ticker, thresholds=thresholds, use_twelvedata=False)
             if not result.get("error"):
                 conn = get_db()
                 try:
