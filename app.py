@@ -260,6 +260,7 @@ def init_db():
         "ALTER TABLE tickers ADD COLUMN owner TEXT",
         "ALTER TABLE settings ADD COLUMN last_weekly_screener_sent TEXT",
         "ALTER TABLE settings ADD COLUMN last_weekly_screener_results TEXT",
+        "ALTER TABLE settings ADD COLUMN last_portfolio_monitor_run TEXT",
     ]:
         try:
             conn.execute(ddl)
@@ -3901,14 +3902,61 @@ def _run_tick_step(name, func):
         print(f"Errore nello step '{name}' del tick (continuo con gli altri): {e}")
 
 
+def _portfolio_monitor_due():
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT last_portfolio_monitor_run FROM settings WHERE id = 1").fetchone()
+    finally:
+        conn.close()
+    if not row or not row["last_portfolio_monitor_run"]:
+        return True
+    try:
+        last = datetime.fromisoformat(row["last_portfolio_monitor_run"])
+    except (ValueError, TypeError):
+        return True
+    return (datetime.now() - last).total_seconds() >= config.PORTFOLIO_MONITOR_MIN_INTERVAL_SECONDS
+
+
+def _mark_portfolio_monitor_run():
+    conn = get_db()
+    try:
+        conn.execute(
+            "INSERT INTO settings (id, last_portfolio_monitor_run) VALUES (1, ?) "
+            "ON CONFLICT(id) DO UPDATE SET last_portfolio_monitor_run = excluded.last_portfolio_monitor_run",
+            (datetime.now().isoformat(timespec="seconds"),),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def run_scheduled_monitor():
+    """Gruppo unico e throttled (config.PORTFOLIO_MONITOR_MIN_INTERVAL_SECONDS,
+    default 5h) per tutto il monitoraggio automatico che consuma dati di
+    mercato: portafoglio, alert di soglia, Opportunità, Decision Engine sul
+    portafoglio, verdetto AI. Prima ognuno di questi girava a OGNI tick
+    (~ogni 10 minuti se GitHub Actions rispettava l'orario) consumando
+    crediti in continuazione anche quando nessuno guardava l'app — su
+    richiesta esplicita, ora il controllo automatico resta (per non perdere
+    gli alert Telegram su stop-loss/target/cambio decisione) ma molto più
+    raro. Le ricerche dirette dell'utente (Scanner, Bottleneck "Analizza",
+    i pulsanti "Aggiorna" manuali) chiamano le funzioni sottostanti
+    direttamente e non passano da qui: non sono mai soggette a questo
+    limite."""
+    if not _portfolio_monitor_due():
+        return
+    _run_tick_step("refresh_all_portfolio", refresh_all_portfolio)
+    _run_tick_step("check_watch_levels", check_watch_levels)
+    _run_tick_step("run_market_screener", lambda: run_market_screener())
+    _run_tick_step("generate_daily_verdict", generate_daily_verdict)
+    _run_tick_step("run_decision_engine_for_portfolio", run_decision_engine_for_portfolio)
+    _mark_portfolio_monitor_run()
+
+
 _TICK_STEPS = [
-    ("refresh_all_portfolio", refresh_all_portfolio),
-    ("check_watch_levels", check_watch_levels),
-    ("run_market_screener", run_market_screener),
-    ("generate_daily_verdict", generate_daily_verdict),
+    ("run_scheduled_monitor", run_scheduled_monitor),
     ("maybe_run_weekly_screener", maybe_run_weekly_screener),
     ("recheck_bottleneck_decisions", recheck_bottleneck_decisions),
-    ("run_decision_engine_for_portfolio", run_decision_engine_for_portfolio),
     ("backfill_decision_outcomes", backfill_decision_outcomes),
 ]
 

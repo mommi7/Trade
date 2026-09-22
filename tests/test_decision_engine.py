@@ -709,6 +709,30 @@ class DecisionEngineRegressionTests(unittest.TestCase):
         self.assertEqual(negative_real["status"], "fail")
         self.assertNotEqual(missing["status"], negative_real["status"])
 
+    # ------------------------------------------------------------------
+    # TEST 29 — su richiesta esplicita: il monitoraggio automatico in
+    # background (portafoglio, alert, Opportunità, Decision Engine,
+    # verdetto AI) deve restare attivo per non perdere gli alert Telegram,
+    # ma molto più raro di prima (era a ogni tick, ~10 minuti). Una
+    # seconda chiamata subito dopo la prima deve essere saltata.
+    # ------------------------------------------------------------------
+    def test_29_scheduled_monitor_throttled_to_hours_not_every_tick(self):
+        self.assertTrue(app._portfolio_monitor_due())
+
+        with patch("app.refresh_all_portfolio") as m1, \
+             patch("app.check_watch_levels") as m2, \
+             patch("app.run_market_screener") as m3, \
+             patch("app.generate_daily_verdict") as m4, \
+             patch("app.run_decision_engine_for_portfolio") as m5:
+            app.run_scheduled_monitor()
+        self.assertTrue(all([m1.called, m2.called, m3.called, m4.called, m5.called]))
+        self.assertFalse(app._portfolio_monitor_due(),
+                          "TEST 29 FALLITO: subito dopo un run, il monitor non deve essere di nuovo dovuto")
+
+        with patch("app.refresh_all_portfolio") as m1_again:
+            app.run_scheduled_monitor()
+        m1_again.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

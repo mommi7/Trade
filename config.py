@@ -66,6 +66,17 @@ PRICE_CACHE_TTL_SECONDS = 5 * 60
 # Il refresh manuale dalla UI ("Aggiorna") ignora questo limite.
 MARKET_SCREENER_MIN_INTERVAL_SECONDS = 60 * 60
 
+# Su richiesta esplicita dell'utente: il monitoraggio automatico in
+# background (portafoglio, alert di soglia, Decision Engine, verdetto AI,
+# Opportunità) deve restare attivo — per non perdere gli alert Telegram
+# automatici su stop-loss/target/cambio decisione — ma molto più raro di
+# prima (era ~ogni 10 minuti a ogni tick GitHub Actions). 5 ore: nel mezzo
+# del range 4-6h richiesto, abbastanza raro da tagliare drasticamente il
+# consumo di crediti giornalieri, abbastanza frequente da restare utile
+# per gli alert. Le ricerche dirette dell'utente (Scanner, Bottleneck
+# "Analizza", refresh manuale) non sono mai soggette a questo limite.
+PORTFOLIO_MONITOR_MIN_INTERVAL_SECONDS = 5 * 3600
+
 # Commento AI opzionale sopra ogni segnale (facoltativo). Usa la API
 # gratuita di Google Gemini (https://aistudio.google.com/apikey — free
 # tier senza carta di credito). Lasciala vuota per non usarla: l'app
